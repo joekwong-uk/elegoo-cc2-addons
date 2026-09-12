@@ -671,7 +671,7 @@
             : `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-purple-900/60 text-purple-300 border border-purple-700/40">Plate A (Textured)</span>`;
 
           const estTime = item.estimated_formatted || formatDuration(item.estimated_seconds);
-          const thumbSrc = `${SLICER_SERVICE_URL}/thumbnail?file=${encodeURIComponent(item.filename)}`;
+          const thumbSrc = `${SLICER_SERVICE_URL}/thumbnail?file=${encodeURIComponent(item.filename)}&v=2`;
 
           html += `
             <div class="flex items-center px-4 py-3 space-x-3">
@@ -943,7 +943,7 @@
         let html = '';
         files.forEach(f => {
           const estTimeStr = f.print_time_formatted || (f.print_time_seconds ? formatDuration(f.print_time_seconds) : '');
-          const thumbSrc = `${SLICER_SERVICE_URL}/thumbnail?file=${encodeURIComponent(f.filename)}`;
+          const thumbSrc = `${SLICER_SERVICE_URL}/thumbnail?file=${encodeURIComponent(f.filename)}&v=2`;
           const fil = f.filament || "PLA";
           const sec = f.print_time_seconds || 0;
           html += `
