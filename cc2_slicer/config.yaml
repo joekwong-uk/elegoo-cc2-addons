@@ -1,0 +1,23 @@
+name: "Elegoo CC2 Headless Slicer & Kiosk"
+version: "1.2.0"
+slug: "cc2_slicer"
+description: "Headless Orca/Elegoo 3MF & STL slicer microservice & Print Kiosk with Live Camera HUD, Queue ETA, and AMS Matching for Centauri Carbon 2"
+url: "https://github.com/joekwong-uk/elegoo-cc2-addons"
+arch:
+  - amd64
+startup: application
+boot: auto
+host_network: true
+ingress: true
+ingress_port: 8765
+panel_icon: mdi:printer-3d-nozzle
+panel_title: "CC2 3D Printer"
+homeassistant_api: true
+map:
+  - config:rw
+options:
+  printer_ip: "192.168.1.100"
+  access_code: ""
+schema:
+  printer_ip: "str"
+  access_code: "str"
