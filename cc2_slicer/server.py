@@ -99,6 +99,7 @@ def patch_pycentauri_cc2() -> None:
             if slot_map is not None:
                 params["slot_map"] = slot_map
 
+            print(f"[CC2] Method 1020 start_print: file={filename}, plate={plate}, slot_map={slot_map}, auto_leveling={auto_leveling}, Calibration_switch={params['Calibration_switch']}, printer_check={config['printer_check']}", flush=True)
             result = await self._cc2_request(1020, params, timeout=15.0)
             return self._wrap_result(1020, result)
 
@@ -745,6 +746,8 @@ def execute_cc2_start_print(
     if tray_id is None:
         tray_id, canvas_id = resolve_tray_and_canvas(slot=slot, filament=filament)
 
+    print(f"[CC2] execute_cc2_start_print: filename={filename}, plate={plate}, slot={slot}, tray_id={tray_id}, canvas_id={canvas_id}, auto_leveling={auto_leveling}, timelapse={timelapse}", flush=True)
+
     import asyncio
     from pycentauri.cc2 import CC2Printer
 
@@ -1377,7 +1380,11 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
             filament = data.get("filament", "PLA")
             slot = data.get("slot")
             tray_id = data.get("tray_id")
-            auto_level = data.get("auto_level", True)
+            raw_auto_level = data.get("auto_level")
+            if raw_auto_level is not None:
+                auto_level = False if str(raw_auto_level).lower() in ("false", "0") else bool(raw_auto_level)
+            else:
+                auto_level = True
             queue_id = data.get("queue_id")
 
             queue = load_queue()
@@ -1395,8 +1402,9 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
 
             if target_job:
                 filename = target_job.get("filename")
-                if "auto_level" in target_job and "auto_level" not in data:
-                    auto_level = target_job.get("auto_level", True)
+                if "auto_level" in target_job and raw_auto_level is None:
+                    job_al = target_job.get("auto_level")
+                    auto_level = False if str(job_al).lower() in ("false", "0") else bool(job_al)
                 if not slot and target_job.get("slot"):
                     slot = target_job.get("slot")
                 if tray_id is None and target_job.get("tray_id") is not None:
@@ -1465,26 +1473,40 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
             content_length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_length)
             try:
-                data = json.loads(body.decode())
+                data = json.loads(body.decode()) if body else {}
                 filename = data.get("filename")
                 if not filename:
                     raise ValueError("Missing filename")
-                cmd = [
-                    "centauri", "print", "start", filename,
-                    "--host", PRINTER_IP, "--access-code", ACCESS_CODE,
-                    "--enable-control"
-                ]
-                res = subprocess.run(cmd, capture_output=True, text=True)
-                if res.returncode == 0:
+                plate = data.get("plate_type") or data.get("plate") or "A"
+                filament = data.get("filament")
+                slot = data.get("slot")
+                tray_id = data.get("tray_id")
+                raw_auto_level = data.get("auto_level")
+                if raw_auto_level is not None:
+                    auto_level = False if str(raw_auto_level).lower() in ("false", "0") else bool(raw_auto_level)
+                else:
+                    auto_level = True
+                timelapse = bool(data.get("timelapse", False))
+
+                ok, msg = execute_cc2_start_print(
+                    filename,
+                    plate=plate,
+                    slot=slot,
+                    tray_id=tray_id,
+                    filament=filament,
+                    auto_leveling=auto_level,
+                    timelapse=timelapse,
+                )
+                if ok:
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
-                    self.wfile.write(json.dumps({"status": "success", "filename": filename, "output": res.stdout}).encode())
+                    self.wfile.write(json.dumps({"status": "success", "filename": filename, "message": msg}).encode())
                 else:
                     self.send_response(500)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
-                    self.wfile.write(json.dumps({"status": "error", "error": res.stderr or res.stdout}).encode())
+                    self.wfile.write(json.dumps({"status": "error", "error": msg}).encode())
             except Exception as e:
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json")
