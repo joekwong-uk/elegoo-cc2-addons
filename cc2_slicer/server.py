@@ -11,6 +11,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -407,6 +408,78 @@ def slice_and_upload(input_path: Path) -> dict:
         "estimated_formatted": format_duration(est_seconds),
         "size_bytes": final_gcode.stat().st_size,
         "uploaded": True,
+        "printer_ip": PRINTER_IP,
+    }
+    if thumb_png:
+        result["thumbnail_b64"] = base64.b64encode(thumb_png).decode("ascii")
+    return result
+
+
+def process_gcode_upload(input_path: Path) -> dict[str, Any]:
+    """
+    Process an already-sliced .gcode file:
+    - Save to OUTPUT_DIR without running OrcaSlicer
+    - Extract and inject dual 144x144 + 300x300 thumbnails if available
+    - Parse estimated duration from G-code comments
+    - Upload directly to CC2 printer storage
+    """
+    t0 = time.time()
+    filename = input_path.name
+    base_name = re.sub(r"\.gcode$", "", filename, flags=re.IGNORECASE)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    final_gcode = OUTPUT_DIR / filename
+
+    if input_path.resolve() != final_gcode.resolve():
+        shutil.copy2(input_path, final_gcode)
+
+    # Parse estimated print time
+    est_seconds = parse_estimated_time_from_gcode(final_gcode) or parse_time_from_string_or_filename(filename) or 3600
+
+    # Check for thumbnails in the G-code
+    thumb_png = extract_thumbnail_from_gcode(final_gcode)
+    if thumb_png:
+        # Re-inject to guarantee both 144x144 (printer LCD) and 300x300 (web) exist
+        inject_gcode_thumbnails(final_gcode, thumb_png)
+        # Cache thumbnail
+        for thumb_dest in [
+            Path("/tmp/uploads/last_thumbnail.png"),
+            Path("/tmp/orca_out/last_thumbnail.png"),
+            Path(f"/config/www/cc2_kiosk/thumbnails/{base_name}.png") if Path("/config/www/cc2_kiosk").exists() else None,
+            Path("/config/www/cc2_kiosk/thumbnails/last_thumbnail.png") if Path("/config/www/cc2_kiosk").exists() else None,
+        ]:
+            if thumb_dest:
+                try:
+                    thumb_dest.parent.mkdir(parents=True, exist_ok=True)
+                    thumb_dest.write_bytes(thumb_png)
+                except Exception:
+                    pass
+
+    # Upload to CC2 printer via pycentauri CLI
+    up_cmd = [
+        "centauri", "upload", str(final_gcode),
+        "--host", PRINTER_IP,
+        "--access-code", ACCESS_CODE,
+        "--enable-control",
+    ]
+    print(f"[*] Uploading pre-sliced G-code to CC2 at {PRINTER_IP}...", flush=True)
+    up_proc = subprocess.run(up_cmd, capture_output=True, text=True, timeout=120)
+
+    upload_ok = (up_proc.returncode == 0)
+    if not upload_ok:
+        print(f"[!] Warning: upload to printer reported: {up_proc.stderr}", flush=True)
+
+    elapsed = round(time.time() - t0, 1)
+    result = {
+        "status": "success",
+        "is_gcode": True,
+        "gcode": final_gcode.name,
+        "filename": final_gcode.name,
+        "slice_time": elapsed,
+        "slice_time_seconds": elapsed,
+        "estimated_seconds": est_seconds,
+        "estimated_formatted": format_duration(est_seconds),
+        "size_bytes": final_gcode.stat().st_size,
+        "uploaded": upload_ok,
         "printer_ip": PRINTER_IP,
     }
     if thumb_png:
@@ -877,7 +950,10 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 f.write(file_data)
 
             try:
-                res = slice_and_upload(saved_path)
+                if saved_path.suffix.lower() == ".gcode":
+                    res = process_gcode_upload(saved_path)
+                else:
+                    res = slice_and_upload(saved_path)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
