@@ -19,7 +19,7 @@ import zipfile
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 from PIL import Image
 
 PORT = 8765
@@ -53,6 +53,25 @@ if Path("/config").exists() and os.access("/config", os.W_OK):
 else:
     QUEUE_FILE = Path("/data/cc2_print_queue.json")
     HISTORY_FILE = Path("/data/cc2_print_history.json")
+
+
+def patch_pycentauri_cc2() -> None:
+    """Ensure pycentauri CC2Printer sends Calibration_switch to method 1020."""
+    try:
+        import pycentauri.cc2 as cc2_mod
+        p = Path(cc2_mod.__file__)
+        txt = p.read_text(encoding="utf-8")
+        if '"Calibration_switch": 1 if auto_leveling else 0' not in txt:
+            old_block = 'params: dict[str, Any] = {\n            "filename": filename,\n            "storage_media": storage,\n        }'
+            new_block = 'params: dict[str, Any] = {\n            "filename": filename,\n            "Filename": filename,\n            "storage_media": storage,\n            "Calibration_switch": 1 if auto_leveling else 0,\n            "calibration_switch": 1 if auto_leveling else 0,\n            "Tlp_Switch": 1 if timelapse else 0,\n        }'
+            if old_block in txt:
+                p.write_text(txt.replace(old_block, new_block), encoding="utf-8")
+                print("[+] Patched pycentauri/cc2.py with Calibration_switch", flush=True)
+    except Exception as e:
+        print(f"[!] Warning checking/patching pycentauri: {e}", flush=True)
+
+
+patch_pycentauri_cc2()
 
 
 def parse_time_from_string_or_filename(s: str) -> int:
@@ -126,21 +145,94 @@ def extract_thumbnail(mf_path: Path, plate_idx: int = 1) -> bytes | None:
     return None
 
 
-def inject_gcode_thumbnails(gcode_path: Path, png_data: bytes) -> None:
-    """Inject standard embedded thumbnail comments so CC2 touch screen and kiosk display model preview."""
+def create_thumbnail_block(img: Image.Image, size: tuple[int, int]) -> list[str]:
+    """Generate G-code thumbnail comment lines for a specific resolution."""
+    thumb = img.copy()
+    thumb.thumbnail(size, Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    thumb.save(buf, format="PNG")
+    data = buf.getvalue()
+    b64 = base64.b64encode(data).decode("ascii")
+    lines = [b64[i : i + 78] for i in range(0, len(b64), 78)]
+    return [
+        f"; thumbnail begin {size[0]}x{size[1]} {len(data)}",
+        *[f"; {l}" for l in lines],
+        "; thumbnail end",
+    ]
+
+
+def extract_thumbnail_from_gcode(gcode_path: Path) -> bytes | None:
+    """Extract embedded thumbnail PNG bytes from G-code comments."""
     try:
-        b64 = base64.b64encode(png_data).decode("ascii")
-        lines = [b64[i : i + 78] for i in range(0, len(b64), 78)]
+        if not gcode_path.exists() or not gcode_path.is_file():
+            return None
+        with open(gcode_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = [f.readline() for _ in range(600)]
+        in_thumb = False
+        b64_lines: list[str] = []
+        found_blocks: dict[str, bytes] = {}
+        curr_res = ""
+        for line in lines:
+            line_s = line.strip()
+            if line_s.startswith("; thumbnail begin"):
+                parts = line_s.split()
+                curr_res = parts[3] if len(parts) > 3 else "thumb"
+                in_thumb = True
+                b64_lines = []
+            elif line_s.startswith("; thumbnail end"):
+                in_thumb = False
+                if b64_lines:
+                    try:
+                        found_blocks[curr_res] = base64.b64decode("".join(b64_lines))
+                    except Exception:
+                        pass
+            elif in_thumb:
+                cleaned = line_s.lstrip(";").strip()
+                b64_lines.append(cleaned)
+
+        if "300x300" in found_blocks:
+            return found_blocks["300x300"]
+        if "320x320" in found_blocks:
+            return found_blocks["320x320"]
+        if "144x144" in found_blocks:
+            return found_blocks["144x144"]
+        if found_blocks:
+            return next(iter(found_blocks.values()))
+    except Exception as e:
+        print(f"[!] Error extracting thumbnail from gcode: {e}", flush=True)
+    return None
+
+
+def inject_gcode_thumbnails(gcode_path: Path, png_data: bytes) -> None:
+    """
+    Inject both 144x144 (required by Elegoo CC2 printer touch screen)
+    and 300x300 (used by Kiosk Web UI and Home Assistant) into the G-code header.
+    """
+    try:
+        img = Image.open(io.BytesIO(png_data))
         thumb_block = [
-            f"; thumbnail begin 300x300 {len(png_data)}",
-            *[f"; {l}" for l in lines],
-            "; thumbnail end",
+            *create_thumbnail_block(img, (144, 144)),
+            *create_thumbnail_block(img, (300, 300)),
             "",
         ]
         with open(gcode_path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
 
-        new_content = "\n".join(thumb_block) + "\n" + content
+        # Strip any existing leading thumbnail blocks to avoid duplicates
+        lines = content.splitlines()
+        idx_end = -1
+        in_thumb = False
+        for i, line in enumerate(lines[:600]):
+            if "; thumbnail begin" in line:
+                in_thumb = True
+            elif "; thumbnail end" in line:
+                in_thumb = False
+                idx_end = i
+            elif not in_thumb and line.strip() and not line.startswith("; thumbnail"):
+                break
+
+        remaining = lines[idx_end + 1 :] if idx_end != -1 else lines
+        new_content = "\n".join(thumb_block) + "\n" + "\n".join(remaining)
         with open(gcode_path, "w", encoding="utf-8") as f:
             f.write(new_content)
     except Exception as e:
@@ -283,6 +375,7 @@ def slice_and_upload(input_path: Path) -> dict:
                 Path("/tmp/uploads/last_thumbnail.png"),
                 Path("/tmp/orca_out/last_thumbnail.png"),
                 Path(f"/config/www/cc2_kiosk/thumbnails/{base_name}.png") if Path("/config/www/cc2_kiosk").exists() else None,
+                Path("/config/www/cc2_kiosk/thumbnails/last_thumbnail.png") if Path("/config/www/cc2_kiosk").exists() else None,
             ]:
                 if thumb_dest:
                     try:
@@ -564,16 +657,85 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
 
         # 6. Thumbnail API
         if clean in ("/api/thumbnail", "/thumbnail"):
-            for cand in [Path("/tmp/uploads/last_thumbnail.png"), Path("/tmp/orca_out/last_thumbnail.png"), Path("/config/www/cc2_kiosk/thumbnails/last_thumbnail.png")]:
-                if cand.exists() and cand.is_file():
-                    data = cand.read_bytes()
-                    self.send_response(200)
-                    self.send_header("Content-Type", "image/png")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.send_header("Cache-Control", "no-cache")
-                    self.end_headers()
-                    self.wfile.write(data)
-                    return
+            parsed_url = urlparse(self.path)
+            query_params = parse_qs(parsed_url.query)
+            requested_file = query_params.get("file", [""])[0]
+
+            data = None
+            if requested_file:
+                base_name = re.sub(r"\.(stl|3mf|gcode)$", "", requested_file, flags=re.IGNORECASE)
+                # Check persistent and temporary disk cache
+                candidates = [
+                    Path(f"/config/www/cc2_kiosk/thumbnails/{base_name}.png"),
+                    Path(f"/tmp/cc2_output/{base_name}.png"),
+                    Path(f"/tmp/uploads/{base_name}.png"),
+                    Path(f"/tmp/orca_out/{base_name}.png"),
+                ]
+                for cand in candidates:
+                    if cand.exists() and cand.is_file():
+                        try:
+                            data = cand.read_bytes()
+                            break
+                        except Exception:
+                            pass
+
+                # If not cached as PNG, try extracting from sliced G-code
+                if not data:
+                    for gc in [
+                        OUTPUT_DIR / f"{base_name}.gcode",
+                        OUTPUT_DIR / requested_file,
+                        UPLOAD_DIR / f"{base_name}.gcode",
+                    ]:
+                        data = extract_thumbnail_from_gcode(gc)
+                        if data:
+                            try:
+                                p = Path(f"/config/www/cc2_kiosk/thumbnails/{base_name}.png")
+                                p.parent.mkdir(parents=True, exist_ok=True)
+                                p.write_bytes(data)
+                            except Exception:
+                                pass
+                            break
+
+                # If still not found, try extracting from .3mf project file
+                if not data:
+                    for mf in [
+                        UPLOAD_DIR / f"{base_name}.3mf",
+                        UPLOAD_DIR / requested_file,
+                    ]:
+                        if mf.exists() and mf.is_file():
+                            data = extract_thumbnail(mf)
+                            if data:
+                                try:
+                                    p = Path(f"/config/www/cc2_kiosk/thumbnails/{base_name}.png")
+                                    p.parent.mkdir(parents=True, exist_ok=True)
+                                    p.write_bytes(data)
+                                except Exception:
+                                    pass
+                                break
+
+            # Fallback to last_thumbnail
+            if not data:
+                for cand in [
+                    Path("/config/www/cc2_kiosk/thumbnails/last_thumbnail.png"),
+                    Path("/tmp/orca_out/last_thumbnail.png"),
+                    Path("/tmp/uploads/last_thumbnail.png"),
+                ]:
+                    if cand.exists() and cand.is_file():
+                        try:
+                            data = cand.read_bytes()
+                            break
+                        except Exception:
+                            pass
+
+            if data:
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
             self.send_response(404)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -827,11 +989,17 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                     return
 
                 target_file = target_job.get("filename")
+                target_auto_level = target_job.get("auto_level", True)
                 cmd = [
                     "centauri", "print", "start", target_file,
                     "--host", PRINTER_IP, "--access-code", ACCESS_CODE,
                     "--enable-control"
                 ]
+                if target_auto_level:
+                    cmd.append("--auto-level")
+                else:
+                    cmd.append("--no-auto-level")
+
                 res = subprocess.run(cmd, capture_output=True, text=True)
                 if res.returncode == 0:
                     # Move to history
@@ -854,6 +1022,7 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                         "display_name": target_job.get("display_name", target_file),
                         "filament": target_job.get("filament", "PLA"),
                         "plate": target_job.get("plate", "A"),
+                        "auto_level": target_auto_level,
                         "started_at": time.time(),
                         "started_at_formatted": time.strftime("%Y-%m-%d %H:%M:%S"),
                         "completed_at": None,
@@ -894,6 +1063,7 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
             filename = data.get("filename")
             plate = data.get("plate_type", "A")
             filament = data.get("filament", "PLA")
+            auto_level = data.get("auto_level", True)
             queue_id = data.get("queue_id")
 
             queue = load_queue()
@@ -911,6 +1081,8 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
 
             if target_job:
                 filename = target_job.get("filename")
+                if "auto_level" in target_job and "auto_level" not in data:
+                    auto_level = target_job.get("auto_level", True)
                 queue = [j for j in queue if j.get("id") != target_job.get("id")]
                 save_queue(queue)
 
@@ -926,6 +1098,11 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 "--host", PRINTER_IP, "--access-code", ACCESS_CODE,
                 "--enable-control"
             ]
+            if auto_level:
+                cmd.append("--auto-level")
+            else:
+                cmd.append("--no-auto-level")
+
             res = subprocess.run(cmd, capture_output=True, text=True)
 
             history = load_history()
@@ -944,6 +1121,7 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 "display_name": (target_job.get("display_name") if target_job else filename),
                 "filament": filament,
                 "plate": plate,
+                "auto_level": auto_level,
                 "started_at": time.time(),
                 "started_at_formatted": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "completed_at": None,
