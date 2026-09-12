@@ -46,6 +46,7 @@ MACHINE_PROFILE = PROFILES_DIR / "machine/Elegoo Centauri Carbon 2 0.4 nozzle.js
 PROCESS_PROFILE = PROFILES_DIR / "process/0.20mm Standard @Elegoo CC2 0.4 nozzle.json"
 FILAMENT_PROFILE = PROFILES_DIR / "filament/Elegoo Rapid PLA+ @ECC2.json"
 OUTPUT_DIR = Path("/tmp/cc2_output")
+UPLOAD_DIR = Path("/tmp/uploads")
 
 # Shared queue and history storage (prefers mounted /config, falls back to persistent /data)
 if Path("/config").exists() and os.access("/config", os.W_OK):
@@ -57,9 +58,53 @@ else:
 
 
 def patch_pycentauri_cc2() -> None:
-    """Ensure pycentauri CC2Printer sends Calibration_switch to method 1020."""
+    """Ensure pycentauri CC2Printer sends Calibration_switch, slot_map, and config to method 1020."""
     try:
         import pycentauri.cc2 as cc2_mod
+
+        async def custom_start_print(
+            self,
+            filename: str,
+            *,
+            storage: str = "local",
+            auto_leveling: bool = True,
+            timelapse: bool = False,
+            plate: str = "A",
+            tray_id: int | None = None,
+            canvas_id: int = 0,
+            slot_map: list[dict[str, Any]] | None = None,
+        ):
+            self._require_control("start_print")
+            if slot_map is None and tray_id is not None:
+                slot_map = [{"t": 0, "canvas_id": int(canvas_id), "tray_id": int(tray_id)}]
+
+            config: dict[str, Any] = {
+                "delay_video": bool(timelapse),
+                "printer_check": bool(auto_leveling),
+                "print_layout": str(plate),
+                "bedlevel_force": False,
+            }
+            if slot_map is not None:
+                config["slot_map"] = slot_map
+
+            params: dict[str, Any] = {
+                "filename": filename,
+                "Filename": filename,
+                "storage_media": storage,
+                "Calibration_switch": 1 if auto_leveling else 0,
+                "calibration_switch": 1 if auto_leveling else 0,
+                "Tlp_Switch": 1 if timelapse else 0,
+                "config": config,
+            }
+            if slot_map is not None:
+                params["slot_map"] = slot_map
+
+            result = await self._cc2_request(1020, params, timeout=15.0)
+            return self._wrap_result(1020, result)
+
+        cc2_mod.CC2Printer.start_print = custom_start_print
+        print("[+] Patched pycentauri.cc2.CC2Printer.start_print with slot_map & config support", flush=True)
+
         p = Path(cc2_mod.__file__)
         txt = p.read_text(encoding="utf-8")
         if '"Calibration_switch": 1 if auto_leveling else 0' not in txt:
@@ -67,7 +112,7 @@ def patch_pycentauri_cc2() -> None:
             new_block = 'params: dict[str, Any] = {\n            "filename": filename,\n            "Filename": filename,\n            "storage_media": storage,\n            "Calibration_switch": 1 if auto_leveling else 0,\n            "calibration_switch": 1 if auto_leveling else 0,\n            "Tlp_Switch": 1 if timelapse else 0,\n        }'
             if old_block in txt:
                 p.write_text(txt.replace(old_block, new_block), encoding="utf-8")
-                print("[+] Patched pycentauri/cc2.py with Calibration_switch", flush=True)
+                print("[+] Patched pycentauri/cc2.py file on disk", flush=True)
     except Exception as e:
         print(f"[!] Warning checking/patching pycentauri: {e}", flush=True)
 
@@ -563,6 +608,188 @@ def match_filament(required_filament: str, ams_slots: dict[str, str]) -> dict[st
     return {"match": False, "slot": None, "loaded_slots": ams_slots, "required": required_filament}
 
 
+def resolve_tray_and_canvas(slot: str | None = None, filament: str | None = None) -> tuple[int, int]:
+    """
+    Map slot name ('A1', 'A2', 'A3', 'A4', 'B1'...) or filament name to (tray_id, canvas_id).
+    Defaults to (0, 0).
+    """
+    if slot:
+        s = str(slot).strip().upper()
+        if s.startswith("A"):
+            try:
+                num = int(s[1:])
+                return (max(0, min(3, num - 1)), 0)
+            except ValueError:
+                pass
+        elif s.startswith("B"):
+            try:
+                num = int(s[1:])
+                return (max(0, min(3, num - 1)), 1)
+            except ValueError:
+                pass
+        elif s.isdigit():
+            num = int(s)
+            return (max(0, min(3, num - 1)), 0)
+
+    # Fall back to matching filament against loaded AMS slots
+    ams = get_ams_slots()
+    matched = match_filament(filament or "PLA", ams)
+    if matched.get("match") and matched.get("slot"):
+        return resolve_tray_and_canvas(slot=matched["slot"])
+
+    return (0, 0)
+
+
+def save_cached_thumbnail(base_name: str, data: bytes) -> None:
+    """Save thumbnail PNG into all relevant caching locations."""
+    if not data:
+        return
+    for dest in [
+        Path(f"/config/www/cc2_kiosk/thumbnails/{base_name}.png") if Path("/config/www/cc2_kiosk").exists() else None,
+        Path(f"/tmp/cc2_output/{base_name}.png"),
+        Path(f"/tmp/uploads/{base_name}.png"),
+        Path(f"/tmp/orca_out/{base_name}.png"),
+    ]:
+        if dest:
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(data)
+            except Exception:
+                pass
+
+
+def fetch_thumbnail_from_printer(filename: str) -> bytes | None:
+    """Fetch file thumbnail directly from CC2 printer via SDCP method 1045."""
+    try:
+        import asyncio
+        from pycentauri.cc2 import CC2Printer
+
+        async def _get():
+            async with await CC2Printer.connect(PRINTER_IP, access_code=ACCESS_CODE, connect_timeout=4.0) as p:
+                res = await p._cc2_request(1045, {"storage_media": "local", "file_name": filename}, timeout=4.0)
+                if isinstance(res, dict) and res.get("error_code") == 0 and res.get("thumbnail"):
+                    return base64.b64decode(res["thumbnail"])
+            return None
+
+        return asyncio.run(_get())
+    except Exception as e:
+        print(f"[!] Warning fetching thumbnail for {filename} from CC2: {e}", flush=True)
+        return None
+
+
+def get_cc2_files_direct() -> list[dict[str, Any]]:
+    """List files directly from CC2 printer via SDCP method 1044 with exact print times."""
+    import asyncio
+    from pycentauri.cc2 import CC2Printer
+
+    async def _list():
+        async with await CC2Printer.connect(PRINTER_IP, access_code=ACCESS_CODE, connect_timeout=5.0) as p:
+            res = await p._cc2_request(1044, {"storage_media": "local", "dir": "/", "limit": 60, "offset": 0}, timeout=5.0)
+            files = []
+            if isinstance(res, dict) and res.get("error_code") == 0:
+                for f in res.get("file_list", []):
+                    fname = f.get("filename", "")
+                    if fname.endswith(".gcode"):
+                        sec = f.get("print_time", 0)
+                        size_bytes = f.get("size", 0)
+                        size_mb = f"{round(size_bytes / (1024*1024), 1)} MB" if size_bytes else ""
+                        color_map = f.get("color_map", [])
+                        filament = color_map[0].get("name", "PLA") if color_map else "PLA"
+                        files.append({
+                            "filename": fname,
+                            "size": size_mb,
+                            "size_bytes": size_bytes,
+                            "layers": f.get("layer", 0),
+                            "print_time_seconds": sec,
+                            "print_time_formatted": format_duration(sec),
+                            "filament": filament,
+                        })
+            return files
+
+    try:
+        return asyncio.run(_list())
+    except Exception as e:
+        print(f"[!] Direct CC2 list_files failed: {e}, falling back to CLI", flush=True)
+        cmd = ["centauri", "files", "--host", PRINTER_IP, "--access-code", ACCESS_CODE]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        files = []
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                line = line.strip()
+                if not line or "file(s) on" in line:
+                    continue
+                parts = re.split(r'\s{2,}', line)
+                if len(parts) >= 1 and parts[0].endswith(".gcode"):
+                    fname = parts[0]
+                    size = parts[1] if len(parts) > 1 else ""
+                    layers = parts[2] if len(parts) > 2 else ""
+                    files.append({"filename": fname, "size": size, "layers": layers})
+        return files
+
+
+def execute_cc2_start_print(
+    filename: str,
+    *,
+    plate: str = "A",
+    slot: str | None = None,
+    tray_id: int | None = None,
+    canvas_id: int = 0,
+    filament: str | None = None,
+    auto_leveling: bool = True,
+    timelapse: bool = False,
+) -> tuple[bool, str]:
+    """
+    Start a print on Elegoo CC2 ensuring exact plate, slot, and tray mapping are sent.
+    Returns (success: bool, message: str).
+    """
+    if tray_id is None:
+        tray_id, canvas_id = resolve_tray_and_canvas(slot=slot, filament=filament)
+
+    import asyncio
+    from pycentauri.cc2 import CC2Printer
+
+    async def _run():
+        async with await CC2Printer.connect(
+            PRINTER_IP,
+            access_code=ACCESS_CODE,
+            enable_control=True,
+            connect_timeout=10.0,
+        ) as printer:
+            res = await printer.start_print(
+                filename,
+                storage="local",
+                auto_leveling=auto_leveling,
+                timelapse=timelapse,
+                plate=plate,
+                tray_id=tray_id,
+                canvas_id=canvas_id,
+            )
+            return res.inner if hasattr(res, "inner") else res
+
+    try:
+        res = asyncio.run(_run())
+        err = res.get("error_code") if isinstance(res, dict) else 0
+        if err == 0:
+            return True, f"Print started successfully for {filename} (Plate {plate}, Slot A{tray_id+1})"
+        else:
+            return False, f"CC2 returned error_code {err}: {res}"
+    except Exception as e:
+        print(f"[!] Pycentauri start_print failed: {e}. Trying CLI fallback...", flush=True)
+        cmd = [
+            "centauri", "print", "start", filename,
+            "--host", PRINTER_IP, "--access-code", ACCESS_CODE,
+            "--enable-control"
+        ]
+        if auto_leveling:
+            cmd.append("--auto-level")
+        else:
+            cmd.append("--no-auto-level")
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode == 0:
+            return True, f"Print started via CLI fallback: {res.stdout}"
+        return False, f"Print start failed: {res.stderr or res.stdout or str(e)}"
+
+
 class SlicerHTTPHandler(BaseHTTPRequestHandler):
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -761,12 +988,7 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                     ]:
                         data = extract_thumbnail_from_gcode(gc)
                         if data:
-                            try:
-                                p = Path(f"/config/www/cc2_kiosk/thumbnails/{base_name}.png")
-                                p.parent.mkdir(parents=True, exist_ok=True)
-                                p.write_bytes(data)
-                            except Exception:
-                                pass
+                            save_cached_thumbnail(base_name, data)
                             break
 
                 # If still not found, try extracting from .3mf project file
@@ -778,16 +1000,18 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                         if mf.exists() and mf.is_file():
                             data = extract_thumbnail(mf)
                             if data:
-                                try:
-                                    p = Path(f"/config/www/cc2_kiosk/thumbnails/{base_name}.png")
-                                    p.parent.mkdir(parents=True, exist_ok=True)
-                                    p.write_bytes(data)
-                                except Exception:
-                                    pass
+                                save_cached_thumbnail(base_name, data)
                                 break
 
-            # Fallback to last_thumbnail
-            if not data:
+                # If still not found, fetch live from CC2 printer storage via SDCP method 1045
+                if not data:
+                    printer_thumb = fetch_thumbnail_from_printer(requested_file)
+                    if printer_thumb:
+                        data = printer_thumb
+                        save_cached_thumbnail(base_name, data)
+
+            # Fallback to last_thumbnail ONLY if NO specific file was requested!
+            if not data and not requested_file:
                 for cand in [
                     Path("/config/www/cc2_kiosk/thumbnails/last_thumbnail.png"),
                     Path("/tmp/orca_out/last_thumbnail.png"),
@@ -817,20 +1041,7 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
 
         # 7. Printer Files API
         if clean in ("/api/files", "/files"):
-            cmd = ["centauri", "files", "--host", PRINTER_IP, "--access-code", ACCESS_CODE]
-            res = subprocess.run(cmd, capture_output=True, text=True)
-            files = []
-            if res.returncode == 0:
-                for line in res.stdout.splitlines():
-                    line = line.strip()
-                    if not line or "file(s) on" in line:
-                        continue
-                    parts = re.split(r'\s{2,}', line)
-                    if len(parts) >= 1 and parts[0].endswith(".gcode"):
-                        fname = parts[0]
-                        size = parts[1] if len(parts) > 1 else ""
-                        layers = parts[2] if len(parts) > 2 else ""
-                        files.append({"filename": fname, "size": size, "layers": layers})
+            files = get_cc2_files_direct()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -984,6 +1195,11 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
             if action == "add":
                 fname = data.get("filename")
                 est = data.get("estimated_seconds")
+                filament = data.get("filament", "PLA")
+                plate = data.get("plate", "A")
+                slot = data.get("slot")
+                tray_id = data.get("tray_id")
+
                 if not est or est in (180, 3600, 5400):
                     cand = OUTPUT_DIR / fname
                     if cand.exists():
@@ -992,12 +1208,28 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                             est = gcode_est
                 if not est:
                     est = parse_time_from_string_or_filename(fname) or 3600
+
+                base_name = re.sub(r"\.(stl|3mf|gcode)$", "", fname, flags=re.IGNORECASE)
+                thumb_path = Path(f"/config/www/cc2_kiosk/thumbnails/{base_name}.png")
+                if not thumb_path.exists():
+                    tdata = fetch_thumbnail_from_printer(fname)
+                    if tdata:
+                        save_cached_thumbnail(base_name, tdata)
+
+                # Resolve slot & tray_id if not explicitly provided
+                if tray_id is None:
+                    tray_id, _cid = resolve_tray_and_canvas(slot=slot, filament=filament)
+                    if not slot:
+                        slot = f"A{tray_id + 1}"
+
                 job = {
                     "id": f"job_{int(time.time() * 1000)}",
                     "filename": fname,
                     "display_name": data.get("display_name", fname),
-                    "filament": data.get("filament", "PLA"),
-                    "plate": data.get("plate", "A"),
+                    "filament": filament,
+                    "slot": slot,
+                    "tray_id": tray_id,
+                    "plate": plate,
                     "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "slice_time_seconds": data.get("slice_time_seconds"),
                     "estimated_seconds": est,
@@ -1066,18 +1298,20 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
 
                 target_file = target_job.get("filename")
                 target_auto_level = target_job.get("auto_level", True)
-                cmd = [
-                    "centauri", "print", "start", target_file,
-                    "--host", PRINTER_IP, "--access-code", ACCESS_CODE,
-                    "--enable-control"
-                ]
-                if target_auto_level:
-                    cmd.append("--auto-level")
-                else:
-                    cmd.append("--no-auto-level")
+                target_plate = target_job.get("plate", "A")
+                target_slot = target_job.get("slot")
+                target_tray_id = target_job.get("tray_id")
+                target_filament = target_job.get("filament", "PLA")
 
-                res = subprocess.run(cmd, capture_output=True, text=True)
-                if res.returncode == 0:
+                ok, msg = execute_cc2_start_print(
+                    target_file,
+                    plate=target_plate,
+                    slot=target_slot,
+                    tray_id=target_tray_id,
+                    filament=target_filament,
+                    auto_leveling=target_auto_level,
+                )
+                if ok:
                     # Move to history
                     queue = [j for j in queue if j.get("id") != target_job.get("id")]
                     save_queue(queue)
@@ -1096,8 +1330,10 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                         "id": target_job.get("id"),
                         "filename": target_file,
                         "display_name": target_job.get("display_name", target_file),
-                        "filament": target_job.get("filament", "PLA"),
-                        "plate": target_job.get("plate", "A"),
+                        "filament": target_filament,
+                        "slot": target_slot or (f"A{target_tray_id + 1}" if target_tray_id is not None else "A1"),
+                        "tray_id": target_tray_id,
+                        "plate": target_plate,
                         "auto_level": target_auto_level,
                         "started_at": time.time(),
                         "started_at_formatted": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1112,13 +1348,13 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
-                    self.wfile.write(json.dumps({"status": "success", "started": target_job.get("id"), "job": history_entry}).encode())
+                    self.wfile.write(json.dumps({"status": "success", "started": target_job.get("id"), "job": history_entry, "message": msg}).encode())
                     return
                 else:
                     self.send_response(500)
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
-                    self.wfile.write(json.dumps({"status": "error", "error": res.stderr or res.stdout}).encode())
+                    self.wfile.write(json.dumps({"status": "error", "error": msg}).encode())
                     return
 
             self.send_response(400)
@@ -1137,8 +1373,10 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 data = {}
 
             filename = data.get("filename")
-            plate = data.get("plate_type", "A")
+            plate = data.get("plate_type") or data.get("plate") or "A"
             filament = data.get("filament", "PLA")
+            slot = data.get("slot")
+            tray_id = data.get("tray_id")
             auto_level = data.get("auto_level", True)
             queue_id = data.get("queue_id")
 
@@ -1159,6 +1397,10 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 filename = target_job.get("filename")
                 if "auto_level" in target_job and "auto_level" not in data:
                     auto_level = target_job.get("auto_level", True)
+                if not slot and target_job.get("slot"):
+                    slot = target_job.get("slot")
+                if tray_id is None and target_job.get("tray_id") is not None:
+                    tray_id = target_job.get("tray_id")
                 queue = [j for j in queue if j.get("id") != target_job.get("id")]
                 save_queue(queue)
 
@@ -1169,17 +1411,14 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"error": "Missing filename"}).encode())
                 return
 
-            cmd = [
-                "centauri", "print", "start", filename,
-                "--host", PRINTER_IP, "--access-code", ACCESS_CODE,
-                "--enable-control"
-            ]
-            if auto_level:
-                cmd.append("--auto-level")
-            else:
-                cmd.append("--no-auto-level")
-
-            res = subprocess.run(cmd, capture_output=True, text=True)
+            ok, msg = execute_cc2_start_print(
+                filename,
+                plate=plate,
+                slot=slot,
+                tray_id=tray_id,
+                filament=filament,
+                auto_leveling=auto_level,
+            )
 
             history = load_history()
             for h in history:
@@ -1196,6 +1435,8 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 "filename": filename,
                 "display_name": (target_job.get("display_name") if target_job else filename),
                 "filament": filament,
+                "slot": slot or (f"A{tray_id + 1}" if tray_id is not None else "A1"),
+                "tray_id": tray_id,
                 "plate": plate,
                 "auto_level": auto_level,
                 "started_at": time.time(),
@@ -1203,19 +1444,19 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 "completed_at": None,
                 "estimated_seconds": est_sec,
                 "estimated_formatted": format_duration(est_sec),
-                "status": "printing",
+                "status": "printing" if ok else "failed",
             }
-            history.insert(0, history_entry)
-            save_history(history)
+            if ok:
+                history.insert(0, history_entry)
+                save_history(history)
 
-            self.send_response(200 if res.returncode == 0 else 500)
+            self.send_response(200 if ok else 500)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({
-                "status": "ok" if res.returncode == 0 else "error",
-                "message": f"Print started for {filename}",
-                "job": history_entry,
-                "output": res.stdout or res.stderr
+                "status": "ok" if ok else "error",
+                "message": msg,
+                "job": history_entry
             }).encode())
             return
 

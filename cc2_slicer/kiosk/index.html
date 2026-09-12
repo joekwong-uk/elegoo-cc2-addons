@@ -749,10 +749,15 @@
       ['A1', 'A2', 'A3', 'A4'].forEach(slot => {
         const loaded = cachedAmsSlots[slot] || "Empty";
         const opt = document.createElement('option');
-        opt.value = loaded;
+        opt.value = slot;
         opt.dataset.slot = slot;
+        opt.dataset.trayId = idx.toString();
+        opt.dataset.canvasId = "0";
+        opt.dataset.filament = loaded;
         opt.innerText = `${slot}: ${loaded}`;
-        if (loaded.toUpperCase().includes(targetFil) || targetFil.includes(loaded.toUpperCase())) {
+        if (job.slot === slot) {
+          matchedIndex = idx;
+        } else if (!job.slot && (loaded.toUpperCase().includes(targetFil) || targetFil.includes(loaded.toUpperCase()))) {
           matchedIndex = idx;
         }
         filSelect.appendChild(opt);
@@ -801,7 +806,8 @@
       const filSelect = document.getElementById('modalFilamentSelect');
       const plateSelect = document.getElementById('modalPlateSelect');
       const warning = document.getElementById('modalFilamentWarning');
-      const selFil = (filSelect.value || "").toUpperCase();
+      const selOpt = filSelect.options[filSelect.selectedIndex];
+      const selFil = ((selOpt ? selOpt.dataset.filament : filSelect.value) || "").toUpperCase();
       const selPlate = plateSelect.value;
 
       if (selFil.includes("PRO") && selPlate === "B") {
@@ -824,6 +830,10 @@
       const filSelect = document.getElementById('modalFilamentSelect');
       const plateSelect = document.getElementById('modalPlateSelect');
       const autoLevel = document.getElementById('modalAutoLevelToggle') ? document.getElementById('modalAutoLevelToggle').checked : true;
+      const selOpt = filSelect.options[filSelect.selectedIndex];
+      const selSlot = selOpt ? (selOpt.dataset.slot || selOpt.value) : "A1";
+      const selTrayId = selOpt ? parseInt(selOpt.dataset.trayId, 10) : 0;
+      const selFilament = selOpt ? (selOpt.dataset.filament || selOpt.innerText) : "PLA";
 
       try {
         const res = await fetch(`${SLICER_SERVICE_URL}/print/confirm_start`, {
@@ -833,7 +843,11 @@
             queue_id: currentModalJob.id,
             filename: currentModalJob.filename,
             plate_type: plateSelect.value,
-            filament: filSelect.value,
+            plate: plateSelect.value,
+            slot: selSlot,
+            tray_id: isNaN(selTrayId) ? 0 : selTrayId,
+            canvas_id: 0,
+            filament: selFilament,
             auto_level: autoLevel
           })
         });
@@ -928,13 +942,22 @@
 
         let html = '';
         files.forEach(f => {
+          const estTimeStr = f.print_time_formatted || (f.print_time_seconds ? formatDuration(f.print_time_seconds) : '');
+          const thumbSrc = `${SLICER_SERVICE_URL}/thumbnail?file=${encodeURIComponent(f.filename)}`;
+          const fil = f.filament || "PLA";
+          const sec = f.print_time_seconds || 0;
           html += `
             <div class="flex items-center justify-between py-2 px-1">
+              <img src="${thumbSrc}" class="w-8 h-8 rounded bg-gray-900 object-contain border border-gray-700/50 mr-2 shrink-0" onerror="this.style.display='none'">
               <div class="min-w-0 flex-1 pr-2">
                 <p class="font-semibold text-white truncate text-xs">${f.filename}</p>
-                <p class="text-[10px] text-gray-400">${f.size || ''} ${f.layers ? '• ' + f.layers + ' layers' : ''}</p>
+                <div class="flex items-center space-x-1.5 text-[10px] text-gray-400">
+                  <span>${f.size || ''}</span>
+                  ${estTimeStr ? `<span>•</span><span class="text-amber-300"><i class="fa-regular fa-clock mr-0.5"></i>${estTimeStr}</span>` : ''}
+                  ${f.layers ? `<span>•</span><span>${f.layers} layers</span>` : ''}
+                </div>
               </div>
-              <button onclick="addExistingFileToQueue('${f.filename}')" class="px-2.5 py-1.5 rounded-lg bg-orange-600 hover:bg-orange-500 text-white text-[11px] font-semibold shrink-0 flex items-center space-x-1">
+              <button onclick="addExistingFileToQueue('${encodeURIComponent(f.filename)}', ${sec}, '${fil}')" class="px-2.5 py-1.5 rounded-lg bg-orange-600 hover:bg-orange-500 text-white text-[11px] font-semibold shrink-0 flex items-center space-x-1">
                 <i class="fa-solid fa-plus text-[10px]"></i>
                 <span>Queue</span>
               </button>
@@ -950,12 +973,19 @@
       document.getElementById('filesModal').classList.add('hidden');
     }
 
-    async function addExistingFileToQueue(filename) {
+    async function addExistingFileToQueue(encodedFilename, estSeconds, filament) {
+      const filename = decodeURIComponent(encodedFilename);
       try {
         await fetch(`${SLICER_SERVICE_URL}/queue`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'add', filename: filename, filament: "PLA", plate: "A" })
+          body: JSON.stringify({
+            action: 'add',
+            filename: filename,
+            filament: filament || "PLA",
+            plate: "A",
+            estimated_seconds: estSeconds || 0
+          })
         });
         closePrinterFilesModal();
         refreshQueue();
