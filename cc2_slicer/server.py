@@ -157,11 +157,57 @@ def parse_estimated_time_from_gcode(gcode_path: Path) -> int:
     return 0
 
 
+def sanitize_3mf_for_slicing(file_path: Path) -> Path:
+    """
+    Sanitizes embedded configs in 3MF archives that cause OrcaSlicer CLI validation errors (exit code 238).
+    Specifically, Bambu Studio and OrcaSlicer GUI export -1 for 'auto' parameters:
+      - raft_first_layer_expansion: -1 -> 0
+      - tree_support_wall_count: -1 -> 1
+      - prime_tower_lift_height: -1 -> 0
+    which fail OrcaSlicer CLI schema validation [0, ...] with exit code 238 (-18).
+    """
+    if file_path.suffix.lower() != ".3mf":
+        return file_path
+
+    sanitized_path = file_path.with_name(f"clean_{file_path.name}")
+    try:
+        fixes = {
+            "raft_first_layer_expansion": "0",
+            "tree_support_wall_count": "1",
+            "prime_tower_lift_height": "0",
+        }
+        with zipfile.ZipFile(file_path, "r") as zin, zipfile.ZipFile(sanitized_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                buf = zin.read(item.filename)
+                if "config" in item.filename.lower() or item.filename.endswith((".json", ".config")):
+                    try:
+                        text = buf.decode("utf-8", errors="ignore")
+                        data = json.loads(text)
+                        modified = False
+                        for k, v in fixes.items():
+                            if k in data and str(data[k]) in ("-1", "-1.0", -1):
+                                data[k] = v
+                                modified = True
+                        if modified:
+                            buf = json.dumps(data, indent=4).encode("utf-8")
+                    except Exception:
+                        pass
+                zout.writestr(item, buf)
+        print(f"[+] Sanitized 3MF project settings for CLI compatibility: {file_path.name}", flush=True)
+        return sanitized_path
+    except Exception as e:
+        print(f"[!] Warning: Failed to sanitize 3MF {file_path.name}: {e}", flush=True)
+        return file_path
+
+
 def slice_and_upload(input_path: Path) -> dict:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     filename = input_path.name
     base_name = re.sub(r"\.(stl|3mf)$", "", filename, flags=re.IGNORECASE)
+
+    # Sanitize 3MF to avoid OrcaSlicer CLI validation errors (code 238)
+    slice_input = sanitize_3mf_for_slicing(input_path)
 
     tmp_slice_dir = Path("/tmp/orca_out")
     tmp_slice_dir.mkdir(parents=True, exist_ok=True)
@@ -180,15 +226,23 @@ def slice_and_upload(input_path: Path) -> dict:
         "--load-settings", str(PROCESS_PROFILE),
         "--load-settings", str(FILAMENT_PROFILE),
         "--outputdir", str(tmp_slice_dir),
-        str(input_path),
+        str(slice_input),
     ]
 
     print(f"[*] Slicing {filename} via OrcaSlicer CLI...", flush=True)
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     slice_time = round(time.time() - t0, 1)
 
+    # Clean up temporary sanitized file
+    if slice_input != input_path:
+        try:
+            slice_input.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     if proc.returncode != 0:
-        raise RuntimeError(f"OrcaSlicer exited code {proc.returncode}: {proc.stderr[-500:]}")
+        err_msg = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(f"OrcaSlicer exited code {proc.returncode}: {err_msg[-500:]}")
 
     gcode_files = list(tmp_slice_dir.glob("*.gcode"))
     if not gcode_files:
@@ -222,9 +276,10 @@ def slice_and_upload(input_path: Path) -> dict:
 
     # Upload to CC2 printer via pycentauri CLI
     up_cmd = [
-        "centauri", "files", "upload", str(final_gcode),
+        "centauri", "upload", str(final_gcode),
         "--host", PRINTER_IP,
         "--access-code", ACCESS_CODE,
+        "--enable-control",
     ]
     print(f"[*] Uploading to CC2 at {PRINTER_IP}...", flush=True)
     up_proc = subprocess.run(up_cmd, capture_output=True, text=True, timeout=120)

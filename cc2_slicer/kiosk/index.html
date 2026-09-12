@@ -136,12 +136,12 @@
     <div id="dropzone" onclick="document.getElementById('fileInput').click()" 
          class="border-2 border-dashed border-gray-700 hover:border-orange-500/70 rounded-xl p-6 text-center cursor-pointer transition-all duration-200 bg-gray-900/40">
       <input type="file" id="fileInput" accept=".3mf,.stl" class="hidden" onchange="handleFileSelected(this)">
-      <div id="dropzonePrompt" class="space-y-2">
+      <div id="dropzonePrompt" class="space-y-2 pointer-events-none">
         <div class="w-12 h-12 mx-auto rounded-full bg-orange-500/10 text-orange-400 flex items-center justify-center text-xl">
           <i class="fa-solid fa-file-arrow-up"></i>
         </div>
-        <p class="text-xs font-semibold text-gray-200">Tap to browse 3MF or STL</p>
-        <p class="text-[11px] text-gray-500">MakerWorld & Printables 3MF supported</p>
+        <p class="text-xs font-semibold text-gray-200">Drag & drop 3MF or STL here</p>
+        <p class="text-[11px] text-gray-400">or tap to browse files • MakerWorld & Printables 3MF supported</p>
       </div>
       <div id="fileDetails" class="hidden flex items-center space-x-3 text-left">
         <div class="w-10 h-10 rounded-lg bg-orange-500/20 text-orange-400 flex items-center justify-center text-lg shrink-0">
@@ -172,8 +172,8 @@
       <div>
         <label class="block text-[11px] text-gray-400 mb-1 font-medium">Plate Preference</label>
         <select id="plateSelect" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-2.5 py-2 text-gray-200 focus:outline-none focus:border-orange-500 text-xs">
-          <option value="B" selected>Plate B (Textured - PLA Pro/ABS)</option>
-          <option value="A">Plate A (Smooth - Standard PLA)</option>
+          <option value="A" selected>Plate A (Textured - PLA Pro/ABS/PETG)</option>
+          <option value="B">Plate B (Smooth - Standard PLA)</option>
         </select>
       </div>
     </div>
@@ -325,8 +325,8 @@
       <div>
         <label class="block text-[11px] text-gray-400 mb-1 font-semibold">Build Plate Type</label>
         <select id="modalPlateSelect" onchange="onModalPlateChange()" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white text-xs focus:outline-none focus:border-orange-500">
-          <option value="B">Plate B (Textured PEI - PLA Pro, ABS, PETG)</option>
-          <option value="A">Plate A (Smooth PEI - Standard PLA)</option>
+          <option value="A">Plate A (Textured PEI - PLA Pro, ABS, PETG)</option>
+          <option value="B">Plate B (Smooth PEI - Standard PLA)</option>
         </select>
       </div>
 
@@ -464,6 +464,61 @@
       document.getElementById('sliceBtn').disabled = true;
     }
 
+    // ───── Drag & Drop Handlers ─────
+    function preventDefaults(e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+
+    ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+      window.addEventListener(eventName, preventDefaults, false);
+      document.body.addEventListener(eventName, preventDefaults, false);
+    });
+
+    const dropzoneEl = document.getElementById('dropzone');
+
+    ['dragenter', 'dragover'].forEach(eventName => {
+      dropzoneEl.addEventListener(eventName, () => {
+        dropzoneEl.classList.add('border-orange-500', 'bg-orange-500/10');
+      }, false);
+      window.addEventListener(eventName, () => {
+        dropzoneEl.classList.add('border-orange-500', 'bg-orange-500/10');
+      }, false);
+    });
+
+    ['dragleave'].forEach(eventName => {
+      dropzoneEl.addEventListener(eventName, () => {
+        dropzoneEl.classList.remove('border-orange-500', 'bg-orange-500/10');
+      }, false);
+    });
+
+    function processDroppedFiles(files) {
+      dropzoneEl.classList.remove('border-orange-500', 'bg-orange-500/10');
+      if (files && files.length > 0) {
+        const file = files[0];
+        const lower = file.name.toLowerCase();
+        if (lower.endsWith('.3mf') || lower.endsWith('.stl')) {
+          handleFileSelected({ files: [file] });
+        } else {
+          alert('Please upload a .3mf or .stl file.');
+        }
+      }
+    }
+
+    dropzoneEl.addEventListener('drop', (e) => {
+      preventDefaults(e);
+      if (e.dataTransfer && e.dataTransfer.files) {
+        processDroppedFiles(e.dataTransfer.files);
+      }
+    }, false);
+
+    window.addEventListener('drop', (e) => {
+      preventDefaults(e);
+      if (e.dataTransfer && e.dataTransfer.files) {
+        processDroppedFiles(e.dataTransfer.files);
+      }
+    }, false);
+
     async function startSliceAndUpload() {
       if (!selectedFile) return;
       const btn = document.getElementById('sliceBtn');
@@ -575,9 +630,9 @@
             ? `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold badge-matched"><i class="fa-solid fa-circle-check mr-1"></i>${filStatus.slot} (${reqFil})</span>`
             : `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold badge-mismatch"><i class="fa-solid fa-triangle-exclamation mr-1"></i>${reqFil} (Missing)</span>`;
 
-          const plateBadge = item.plate === 'A'
-            ? `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900/60 text-blue-300 border border-blue-700/40">Plate A</span>`
-            : `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-purple-900/60 text-purple-300 border border-purple-700/40">Plate B</span>`;
+          const plateBadge = item.plate === 'B'
+            ? `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900/60 text-blue-300 border border-blue-700/40">Plate B (Smooth)</span>`
+            : `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-purple-900/60 text-purple-300 border border-purple-700/40">Plate A (Textured)</span>`;
 
           const estTime = item.estimated_formatted || formatDuration(item.estimated_seconds);
 
@@ -672,8 +727,8 @@
       const plateSelect = document.getElementById('modalPlateSelect');
       if (job.plate) {
         plateSelect.value = job.plate;
-      } else if (targetFil.includes("PRO") || targetFil.includes("ABS")) {
-        plateSelect.value = "B";
+      } else if (targetFil.includes("PRO") || targetFil.includes("ABS") || targetFil.includes("PETG")) {
+        plateSelect.value = "A";
       } else {
         plateSelect.value = "A";
       }
@@ -705,11 +760,11 @@
       const selFil = (filSelect.value || "").toUpperCase();
       const selPlate = plateSelect.value;
 
-      if (selFil.includes("PRO") && selPlate === "A") {
-        warning.innerText = "Notice: PLA Pro typically requires Plate B (Textured PEI).";
+      if (selFil.includes("PRO") && selPlate === "B") {
+        warning.innerText = "Notice: PLA Pro typically prints best on Plate A (Textured PEI).";
         warning.classList.remove('hidden');
-      } else if (selFil.includes("PETG") && selPlate === "A") {
-        warning.innerText = "Notice: PETG can bond too strongly to Smooth Plate A.";
+      } else if (selFil.includes("PETG") && selPlate === "B") {
+        warning.innerText = "Notice: PETG can bond too strongly to Smooth Plate B.";
         warning.classList.remove('hidden');
       } else {
         warning.classList.add('hidden');
@@ -854,7 +909,7 @@
         await fetch(`${SLICER_SERVICE_URL}/queue`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'add', filename: filename, filament: "PLA", plate: "B" })
+          body: JSON.stringify({ action: 'add', filename: filename, filament: "PLA", plate: "A" })
         });
         closePrinterFilesModal();
         refreshQueue();

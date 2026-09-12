@@ -33,8 +33,8 @@ Desktop 3D printing workflows have not kept up with mobile smart homes:
    > **Our Solution:** Download the `.3mf` or `.stl` on your phone, open your Home Assistant mobile app, tap upload, and your home server slices it in ~5 seconds with automated tree supports and pushes it straight to printer storage.
 
 2. **The "Blind Filament" & Plate Mismatch Problem:**
-   Stock slicer automation often blindly picks **Slot A1** (usually standard PLA) regardless of design specifications. If a model requires **PLA Pro**, **PETG**, or **ABS** on a textured PEI plate (**Plate B**), printing on smooth **Plate A** with regular PLA leads to ruined prints, bed adhesion failure, or plate damage.
-   > **Our Solution:** A pre-print confirmation modal that inspects your live Canvas AMS slots (A1–A4). When PLA Pro is requested, it automatically enforces **Plate B** and selects **Slot A3 (PLA PRO)** with proactive compatibility warnings.
+   Stock slicer automation often blindly picks **Slot A1** (usually standard PLA) regardless of design specifications. If a model requires **PLA Pro**, **PETG**, or **ABS** on a textured PEI plate (**Plate A**), printing on smooth **Plate B** with regular PLA leads to ruined prints, bed adhesion failure, or plate damage.
+   > **Our Solution:** A pre-print confirmation modal that inspects your live Canvas AMS slots (A1–A4). When PLA Pro is requested, it automatically enforces **Plate A (Textured PEI)** and selects the matching AMS slot with proactive compatibility warnings.
 
 3. **Lack of a Persistent Multi-Job Queue with Cumulative Time:**
    The stock printer interface only handles one job at a time. When organizing a multi-part project or batch of prints, you have no way to queue 4 files, check individual durations, and see cumulative time to clear the entire plate backlog.
@@ -84,7 +84,7 @@ Unlike lightweight home automation integrations that simply read sensors, this a
 - **📹 Live Chamber Camera HUD:** High-framerate stream from port 8080 with dynamic HUD overlay (filename, elapsed timer, start timestamp, remaining ETA, progress bar).
 - **🖼️ 3D Model Object Preview:** Automatically extracts embedded 3MF thumbnails (144x144 and 300x300) and injects them into G-code for CC2 touchscreen and kiosk display.
 - **🎨 Canvas AMS Dynamic Matching:** Integrates with Home Assistant sensors to read loaded spool types and colors across slots A1–A4 in real-time.
-- **🛡️ Plate Type & PLA Pro Safeguard:** Interactive selection between Smooth Plate A and Textured Plate B with automated material recommendations.
+- **🛡️ Plate Type & PLA Pro Safeguard:** Interactive selection between Textured Plate A and Smooth Plate B with automated material recommendations.
 - **📋 Multi-Job Queue Management:** Auto-queues sliced models or adds existing `.gcode` files from CC2 eMMC storage, displaying individual job durations and total queue clearance time.
 - **📜 Persistent Print History:** Stores completed and active print history in `/config/cc2_print_history.json` across reboots.
 - **🔒 Passcode-Protected LAN Mode:** Fully compatible with Elegoo CC2 LAN mode passcode security.
