@@ -59,10 +59,15 @@ def parse_time_from_string_or_filename(s: str) -> int:
     """Parse duration like '1h28m', '4h9m', '45m', '1h 30m 15s' into seconds."""
     if not s:
         return 0
+    # Strip file extension so .3mf never triggers "3m" (which equals 180s!)
+    s_clean = re.sub(r"\.[a-zA-Z0-9]+$", "", s)
     total = 0
-    h_match = re.search(r"(\d+)\s*h", s, re.IGNORECASE)
-    m_match = re.search(r"(\d+)\s*m", s, re.IGNORECASE)
-    s_match = re.search(r"(\d+)\s*s", s, re.IGNORECASE)
+    d_match = re.search(r"(\d+)\s*d(?![a-zA-Z])", s_clean, re.IGNORECASE)
+    h_match = re.search(r"(\d+)\s*h(?![a-zA-Z])", s_clean, re.IGNORECASE)
+    m_match = re.search(r"(\d+)\s*m(?![a-zA-Z])", s_clean, re.IGNORECASE)
+    s_match = re.search(r"(\d+)\s*s(?![a-zA-Z])", s_clean, re.IGNORECASE)
+    if d_match:
+        total += int(d_match.group(1)) * 86400
     if h_match:
         total += int(h_match.group(1)) * 3600
     if m_match:
@@ -143,17 +148,29 @@ def inject_gcode_thumbnails(gcode_path: Path, png_data: bytes) -> None:
 
 
 def parse_estimated_time_from_gcode(gcode_path: Path) -> int:
+    """
+    Parse actual sliced print duration from G-code comments.
+    OrcaSlicer outputs '; estimated printing time (normal mode) = Xh Ym Zs'
+    at the very end of the file.
+    """
     try:
-        with open(gcode_path, "r", encoding="utf-8", errors="replace") as f:
-            for i, line in enumerate(f):
-                if i > 250:
-                    break
-                if "estimated printing time" in line.lower():
-                    m = re.search(r"=\s*(.+)", line)
-                    if m:
-                        return parse_time_from_string_or_filename(m.group(1))
-    except Exception:
-        pass
+        size = gcode_path.stat().st_size
+        read_size = min(size, 262144)  # Read up to last 256KB
+        with open(gcode_path, "rb") as f:
+            if size > read_size:
+                f.seek(size - read_size)
+            chunk = f.read().decode("utf-8", errors="ignore")
+
+        for line in reversed(chunk.splitlines()):
+            line_l = line.lower()
+            if "estimated printing time" in line_l and "first layer" not in line_l:
+                m = re.search(r"=\s*(.+)", line)
+                if m:
+                    parsed = parse_time_from_string_or_filename(m.group(1).strip())
+                    if parsed > 0:
+                        return parsed
+    except Exception as e:
+        print(f"[!] Error parsing gcode estimated time: {e}", flush=True)
     return 0
 
 
@@ -437,17 +454,33 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
             ams = get_ams_slots()
             total_eta = 0
             enhanced = []
+            queue_dirty = False
             for idx, item in enumerate(queue):
                 item_copy = dict(item)
                 req_fil = item.get("filament", "PLA")
                 item_copy["filament_status"] = match_filament(req_fil, ams)
                 item_copy["position"] = idx + 1
-                est = item.get("estimated_seconds") or parse_time_from_string_or_filename(item.get("filename", "")) or 3600
+                est = item.get("estimated_seconds")
+                # Auto-repair duration from G-code if available or if previously miscalculated as 180s
+                if not est or est == 180 or est == 3600:
+                    cand = OUTPUT_DIR / item.get("filename", "")
+                    if cand.exists():
+                        gcode_est = parse_estimated_time_from_gcode(cand)
+                        if gcode_est > 0:
+                            est = gcode_est
+                            item["estimated_seconds"] = est
+                            item["estimated_formatted"] = format_duration(est)
+                            queue_dirty = True
+                if not est:
+                    est = parse_time_from_string_or_filename(item.get("filename", "")) or 3600
                 item_copy["estimated_seconds"] = est
                 item_copy["estimated_formatted"] = format_duration(est)
                 if item.get("status") != "printing":
                     total_eta += est
                 enhanced.append(item_copy)
+
+            if queue_dirty:
+                save_queue(queue)
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -712,7 +745,15 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
 
             if action == "add":
                 fname = data.get("filename")
-                est = data.get("estimated_seconds") or parse_time_from_string_or_filename(fname) or 3600
+                est = data.get("estimated_seconds")
+                if not est or est in (180, 3600, 5400):
+                    cand = OUTPUT_DIR / fname
+                    if cand.exists():
+                        gcode_est = parse_estimated_time_from_gcode(cand)
+                        if gcode_est > 0:
+                            est = gcode_est
+                if not est:
+                    est = parse_time_from_string_or_filename(fname) or 3600
                 job = {
                     "id": f"job_{int(time.time() * 1000)}",
                     "filename": fname,
