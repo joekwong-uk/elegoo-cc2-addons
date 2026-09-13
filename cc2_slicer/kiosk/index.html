@@ -2,6 +2,7 @@
 <html lang="en" class="dark">
 <head>
   <meta charset="UTF-8">
+  <meta name="referrer" content="no-referrer-when-downgrade">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>CC2 Mobile Print Kiosk</title>
   <script src="https://cdn.tailwindcss.com"></script>
@@ -69,7 +70,7 @@
   <!-- Live Chamber Preview with Camera HUD Overlay -->
   <section class="glass-card rounded-2xl overflow-hidden shadow-lg">
     <div class="relative aspect-video bg-black/80 flex items-center justify-center overflow-hidden">
-      <img id="cameraFeed" src="/api/cc2_slicer/camera" 
+      <img id="cameraFeed" src="" 
             class="w-full h-full object-cover" 
             onerror="onCameraError()" 
             alt="Chamber Camera">
@@ -429,13 +430,63 @@
       el.classList.toggle('hidden');
     }
 
+    // ───── Home Assistant Authentication Helper ─────
+    function getHaAuthToken() {
+      try {
+        const sources = [window.parent.localStorage, window.localStorage, window.parent.sessionStorage, window.sessionStorage];
+        for (const src of sources) {
+          if (!src) continue;
+          const raw = src.getItem('hassTokens');
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed && parsed.access_token) return parsed.access_token;
+          }
+        }
+      } catch (e) {}
+      try {
+        if (window.parent && window.parent.hassConnection) {
+          const conn = window.parent.hassConnection;
+          if (conn && conn.auth && conn.auth.accessToken) return conn.auth.accessToken;
+        }
+      } catch (e) {}
+      const params = new URLSearchParams(window.location.search);
+      return params.get('token') || '';
+    }
+
+    function authFetch(url, options = {}) {
+      const token = getHaAuthToken();
+      const opts = { ...options };
+      let headers = opts.headers || {};
+      if (headers instanceof Headers) {
+        if (token && !headers.has('Authorization')) {
+          headers.set('Authorization', `Bearer ${token}`);
+        }
+      } else {
+        headers = { ...headers };
+        if (token && !headers['Authorization'] && !headers['authorization']) {
+          headers['Authorization'] = `Bearer ${token}`;
+        }
+      }
+      opts.headers = headers;
+      return fetch(url, opts);
+    }
+
+    function getThumbnailUrl(filename, extraParam = '') {
+      const token = getHaAuthToken();
+      const tokenParam = token ? `&token=${encodeURIComponent(token)}` : '';
+      const extra = extraParam ? `&${extraParam}` : '';
+      return `${SLICER_SERVICE_URL}/thumbnail?file=${encodeURIComponent(filename)}${extra}${tokenParam}`;
+    }
+
     // ───── Camera Handlers ─────
     function reconnectCamera() {
       const img = document.getElementById('cameraFeed');
       const fallback = document.getElementById('cameraFallback');
       fallback.classList.add('hidden');
       img.style.display = 'block';
-      img.src = `${SLICER_SERVICE_URL}/camera?t=${Date.now()}`;
+      const token = getHaAuthToken();
+      const tokenParam = token ? `&token=${encodeURIComponent(token)}` : '';
+      img.src = `${SLICER_SERVICE_URL}/camera?t=${Date.now()}${tokenParam}`;
     }
 
     function onCameraError() {
@@ -447,7 +498,7 @@
 
     // ───── Service Check ─────
     function checkService() {
-      fetch(`${SLICER_SERVICE_URL}/status`)
+      authFetch(`${SLICER_SERVICE_URL}/status`)
         .then(r => r.json())
         .then(() => {
           document.getElementById('serviceBadge').className = "flex items-center space-x-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-950/60 text-emerald-400 border border-emerald-800/40";
@@ -563,7 +614,7 @@
       document.getElementById('resultCard').classList.add('hidden');
 
       try {
-        const response = await fetch(`${SLICER_SERVICE_URL}/upload`, { method: "POST", body: formData });
+        const response = await authFetch(`${SLICER_SERVICE_URL}/upload`, { method: "POST", body: formData });
         const result = await response.json();
         if (response.ok && result.status === "success") {
           document.getElementById('resultCard').classList.remove('hidden');
@@ -576,7 +627,7 @@
           btn.innerHTML = '<i class="fa-solid fa-check"></i><span>Success! Queued</span>';
 
           // Auto add to queue
-          await fetch(`${SLICER_SERVICE_URL}/queue`, {
+          await authFetch(`${SLICER_SERVICE_URL}/queue`, {
             method: "POST",
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -607,7 +658,7 @@
     // ───── Print Status HUD ─────
     async function refreshPrintStatus() {
       try {
-        const res = await fetch(`${SLICER_SERVICE_URL}/print/status`);
+        const res = await authFetch(`${SLICER_SERVICE_URL}/print/status`);
         if (!res.ok) return;
         const data = await res.json();
         const hud = document.getElementById('printHud');
@@ -631,7 +682,7 @@
     // ───── Queue Management ─────
     async function refreshQueue() {
       try {
-        const res = await fetch(`${SLICER_SERVICE_URL}/queue`);
+        const res = await authFetch(`${SLICER_SERVICE_URL}/queue`);
         if (!res.ok) return;
         const data = await res.json();
         const items = data.queue || data.items || [];
@@ -671,7 +722,7 @@
             : `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-purple-900/60 text-purple-300 border border-purple-700/40">Plate A (Textured)</span>`;
 
           const estTime = item.estimated_formatted || formatDuration(item.estimated_seconds);
-          const thumbSrc = `${SLICER_SERVICE_URL}/thumbnail?file=${encodeURIComponent(item.filename)}&v=2`;
+          const thumbSrc = getThumbnailUrl(item.filename, 'v=2');
 
           html += `
             <div class="flex items-center px-4 py-3 space-x-3">
@@ -721,7 +772,7 @@
 
     async function deleteFromQueue(jobId) {
       try {
-        await fetch(`${SLICER_SERVICE_URL}/queue`, {
+        await authFetch(`${SLICER_SERVICE_URL}/queue`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action: 'delete', id: jobId })
@@ -781,7 +832,7 @@
       const fallback = document.getElementById('modalThumbFallback');
       thumb.onload = () => { thumb.classList.remove('hidden'); fallback.classList.add('hidden'); };
       thumb.onerror = () => { thumb.classList.add('hidden'); fallback.classList.remove('hidden'); };
-      thumb.src = `${SLICER_SERVICE_URL}/thumbnail?file=${encodeURIComponent(job.filename)}&t=${Date.now()}`;
+      thumb.src = getThumbnailUrl(job.filename, `t=${Date.now()}`);
 
       // Initialize Auto Bed Leveling toggle (default ON or preserved from job)
       const autoToggle = document.getElementById('modalAutoLevelToggle');
@@ -836,7 +887,7 @@
       const selFilament = selOpt ? (selOpt.dataset.filament || selOpt.innerText) : "PLA";
 
       try {
-        const res = await fetch(`${SLICER_SERVICE_URL}/print/confirm_start`, {
+        const res = await authFetch(`${SLICER_SERVICE_URL}/print/confirm_start`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -872,7 +923,7 @@
     // ───── History Management ─────
     async function refreshHistory() {
       try {
-        const res = await fetch(`${SLICER_SERVICE_URL}/history`);
+        const res = await authFetch(`${SLICER_SERVICE_URL}/history`);
         if (!res.ok) return;
         const data = await res.json();
         const items = data.history || data.items || [];
@@ -931,7 +982,7 @@
       list.innerHTML = '<div class="text-center py-8 text-gray-500"><i class="fa-solid fa-spinner fa-spin text-lg mb-2"></i><p>Loading files from CC2 storage...</p></div>';
 
       try {
-        const res = await fetch(`${SLICER_SERVICE_URL}/files`);
+        const res = await authFetch(`${SLICER_SERVICE_URL}/files`);
         const data = await res.json();
         const files = data.files || [];
 
@@ -943,7 +994,7 @@
         let html = '';
         files.forEach(f => {
           const estTimeStr = f.print_time_formatted || (f.print_time_seconds ? formatDuration(f.print_time_seconds) : '');
-          const thumbSrc = `${SLICER_SERVICE_URL}/thumbnail?file=${encodeURIComponent(f.filename)}&v=2`;
+          const thumbSrc = getThumbnailUrl(f.filename, 'v=2');
           const fil = f.filament || "PLA";
           const sec = f.print_time_seconds || 0;
           html += `
@@ -976,7 +1027,7 @@
     async function addExistingFileToQueue(encodedFilename, estSeconds, filament) {
       const filename = decodeURIComponent(encodedFilename);
       try {
-        await fetch(`${SLICER_SERVICE_URL}/queue`, {
+        await authFetch(`${SLICER_SERVICE_URL}/queue`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -995,6 +1046,7 @@
     }
 
     // ───── Init & Periodic Polling ─────
+    reconnectCamera();
     checkService();
     refreshPrintStatus();
     refreshQueue();
