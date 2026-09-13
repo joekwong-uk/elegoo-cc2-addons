@@ -117,11 +117,33 @@ def patch_pycentauri_cc2() -> None:
             if old_block in txt:
                 p.write_text(txt.replace(old_block, new_block), encoding="utf-8")
                 print("[+] Patched pycentauri/cc2.py file on disk", flush=True)
+
+        # Ensure upload.py supports UTF-8 filenames without crashing httpx ascii header validation
+        try:
+            import pycentauri.upload as up_mod
+            p_up = Path(up_mod.__file__)
+            t_up = p_up.read_text(encoding="utf-8")
+            new_t_up = re.sub(r'"X-File-Name":\s*name,', '"X-File-Name": name.encode("utf-8"),', t_up)
+            if new_t_up != t_up:
+                p_up.write_text(new_t_up, encoding="utf-8")
+                print("[+] Patched pycentauri/upload.py for UTF-8 filename support", flush=True)
+        except Exception as e_up:
+            print(f"[!] Warning patching pycentauri upload: {e_up}", flush=True)
     except Exception as e:
         print(f"[!] Warning checking/patching pycentauri: {e}", flush=True)
 
 
 patch_pycentauri_cc2()
+
+
+def sanitize_filename(name: str) -> str:
+    """Normalize tricky punctuation like en-dash, em-dash, and quotes in filenames."""
+    if not name:
+        return ""
+    name = name.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
+    name = name.replace("\u2018", "'").replace("\u2019", "'")
+    name = name.replace("\u201c", '"').replace("\u201d", '"')
+    return name.strip()
 
 
 def parse_time_from_string_or_filename(s: str) -> int:
@@ -172,21 +194,46 @@ def format_duration_hms(seconds: int | float | None) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def extract_thumbnail(mf_path: Path, plate_idx: int = 1) -> bytes | None:
+def extract_thumbnail(mf_path: Path, plate_idx: int = 1, thumb_file: str | None = None) -> bytes | None:
     try:
         with zipfile.ZipFile(mf_path) as z:
-            candidates = [
+            namelist = set(z.namelist())
+            candidates = []
+            if thumb_file:
+                candidates.extend([thumb_file, f"Metadata/{thumb_file}"])
+            candidates.extend([
                 f"Metadata/plate_{plate_idx}.png",
                 f"Metadata/plate_{plate_idx}_small.png",
-                f"Metadata/plate_{plate_idx + 1}.png",
+                f"Metadata/plate_{plate_idx}.jpg",
+                f"Metadata/plate_{plate_idx}.jpeg",
+                f"Metadata/plate_{plate_idx}.webp",
+            ])
+            if plate_idx == 1:
+                candidates.extend([
+                    "Metadata/plate_1.png",
+                    "Metadata/top_1.png",
+                    "Auxiliaries/.thumbnails/thumbnail_middle.png",
+                    "Auxiliaries/.thumbnails/thumbnail_3mf.png",
+                    "Auxiliaries/.thumbnails/thumbnail_small.png",
+                ])
+            for cand in candidates:
+                if cand in namelist:
+                    data = z.read(cand)
+                    img = Image.open(io.BytesIO(data))
+                    img.thumbnail((300, 300), Image.Resampling.LANCZOS)
+                    buf = io.BytesIO()
+                    img.save(buf, format="PNG")
+                    return buf.getvalue()
+            # If still not found and plate_idx > 1, allow general fallback
+            fallback_candidates = [
                 "Metadata/plate_1.png",
                 "Metadata/top_1.png",
                 "Auxiliaries/.thumbnails/thumbnail_middle.png",
                 "Auxiliaries/.thumbnails/thumbnail_3mf.png",
                 "Auxiliaries/.thumbnails/thumbnail_small.png",
             ]
-            for cand in candidates:
-                if cand in z.namelist():
+            for cand in fallback_candidates:
+                if cand in namelist:
                     data = z.read(cand)
                     img = Image.open(io.BytesIO(data))
                     img.thumbnail((300, 300), Image.Resampling.LANCZOS)
@@ -194,7 +241,7 @@ def extract_thumbnail(mf_path: Path, plate_idx: int = 1) -> bytes | None:
                     img.save(buf, format="PNG")
                     return buf.getvalue()
             # Try any picture in Auxiliaries/Model Pictures/
-            for name in z.namelist():
+            for name in namelist:
                 if name.startswith("Auxiliaries/Model Pictures/") and name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
                     data = z.read(name)
                     img = Image.open(io.BytesIO(data))
@@ -239,6 +286,34 @@ def extract_3mf_title(archive_path: Path) -> str | None:
     except Exception as e:
         print(f"[!] Warning extracting 3MF title: {e}", flush=True)
     return None
+
+
+def get_3mf_plates(archive_path: Path) -> list[dict[str, Any]]:
+    """Extract all plate configurations and names from a 3MF project file."""
+    plates = []
+    try:
+        with zipfile.ZipFile(archive_path, "r") as z:
+            if "Metadata/model_settings.config" in z.namelist():
+                xml_data = z.read("Metadata/model_settings.config")
+                root = ET.fromstring(xml_data)
+                for pl in root.findall(".//plate"):
+                    pid = None
+                    pname = ""
+                    pthumb = ""
+                    for m in pl.findall("metadata"):
+                        k = m.get("key")
+                        v = m.get("value", "")
+                        if k == "plater_id":
+                            pid = int(v) if v.isdigit() else v
+                        elif k == "plater_name":
+                            pname = v.strip()
+                        elif k == "thumbnail_file":
+                            pthumb = v.strip()
+                    if pid is not None:
+                        plates.append({"id": pid, "name": pname, "thumbnail": pthumb})
+    except Exception as e:
+        print(f"[!] Warning reading 3MF plates: {e}", flush=True)
+    return plates
 
 
 def create_thumbnail_block(img: Image.Image, size: tuple[int, int]) -> list[str]:
@@ -409,7 +484,7 @@ def slice_and_upload(input_path: Path) -> dict:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     filename = input_path.name
-    base_name = re.sub(r"\.(stl|3mf|smf)$", "", filename, flags=re.IGNORECASE)
+    base_name = sanitize_filename(re.sub(r"\.(stl|3mf|smf)$", "", filename, flags=re.IGNORECASE))
 
     # Sanitize 3MF to avoid OrcaSlicer CLI validation errors (code 238)
     slice_input = sanitize_3mf_for_slicing(input_path)
@@ -427,6 +502,7 @@ def slice_and_upload(input_path: Path) -> dict:
         "xvfb-run", "-a",
         ORCA_BIN,
         "--slice", "0",
+        "--allow-newer-file",
         "--load-settings", str(MACHINE_PROFILE),
         "--load-settings", str(PROCESS_PROFILE),
         "--load-settings", str(FILAMENT_PROFILE),
@@ -449,64 +525,103 @@ def slice_and_upload(input_path: Path) -> dict:
         err_msg = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"OrcaSlicer exited code {proc.returncode}: {err_msg[-500:]}")
 
-    gcode_files = list(tmp_slice_dir.glob("*.gcode"))
+    gcode_files = sorted(
+        list(tmp_slice_dir.glob("*.gcode")),
+        key=lambda p: int(re.search(r"plate_(\d+)", p.name).group(1)) if re.search(r"plate_(\d+)", p.name) else 0
+    )
     if not gcode_files:
         raise RuntimeError(f"No .gcode generated in {tmp_slice_dir}")
 
-    gcode_path = gcode_files[0]
-    final_gcode = OUTPUT_DIR / f"{base_name}.gcode"
-    gcode_path.rename(final_gcode)
+    plates_meta = get_3mf_plates(input_path) if input_path.suffix.lower() in (".3mf", ".smf") else []
+    is_multi_plate = len(gcode_files) > 1
 
-    # Parse estimated print time
-    est_seconds = parse_estimated_time_from_gcode(final_gcode) or parse_time_from_string_or_filename(filename) or 3600
+    plates_result = []
+    for idx, gcode_file in enumerate(gcode_files):
+        m_idx = re.search(r"plate_(\d+)", gcode_file.name)
+        plate_num = int(m_idx.group(1)) if m_idx else (idx + 1)
 
-    # Extract thumbnail if 3MF
-    thumb_png = None
-    if input_path.suffix.lower() in (".3mf", ".smf"):
-        thumb_png = extract_thumbnail(input_path)
-        if thumb_png:
-            inject_gcode_thumbnails(final_gcode, thumb_png)
-            # Cache thumbnail
-            for thumb_dest in [
-                Path("/tmp/uploads/last_thumbnail.png"),
-                Path("/tmp/orca_out/last_thumbnail.png"),
-                Path(f"/config/www/cc2_kiosk/thumbnails/{base_name}.png") if Path("/config/www/cc2_kiosk").exists() else None,
-                Path("/config/www/cc2_kiosk/thumbnails/last_thumbnail.png") if Path("/config/www/cc2_kiosk").exists() else None,
-            ]:
-                if thumb_dest:
-                    try:
-                        thumb_dest.parent.mkdir(parents=True, exist_ok=True)
-                        thumb_dest.write_bytes(thumb_png)
-                    except Exception:
-                        pass
+        pm = next((p for p in plates_meta if p.get("id") == plate_num), {})
+        pname = sanitize_filename(pm.get("name", "").strip())
 
-    # Upload to CC2 printer via pycentauri CLI (non-fatal if printer is printing/busy)
-    up_cmd = [
-        "centauri", "upload", str(final_gcode),
-        "--host", PRINTER_IP,
-        "--access-code", ACCESS_CODE,
-        "--enable-control",
-    ]
-    print(f"[*] Uploading to CC2 at {PRINTER_IP}...", flush=True)
-    up_proc = subprocess.run(up_cmd, capture_output=True, text=True, timeout=120)
-    upload_ok = (up_proc.returncode == 0)
-    if not upload_ok:
-        print(f"[!] Note: CC2 file upload postponed (printer is busy/printing): {up_proc.stderr}", flush=True)
+        if is_multi_plate:
+            final_gcode_name = f"{base_name}_plate_{plate_num}.gcode"
+            if pname and pname.lower() != base_name.lower():
+                disp_name = f"{base_name} - {pname}"
+            else:
+                disp_name = f"{base_name} - Plate {plate_num}"
+        else:
+            final_gcode_name = f"{base_name}.gcode"
+            disp_name = base_name
 
+        final_gcode = OUTPUT_DIR / final_gcode_name
+        if final_gcode.exists():
+            try:
+                final_gcode.unlink()
+            except Exception:
+                pass
+        gcode_file.rename(final_gcode)
+
+        # Parse estimated print time
+        est_seconds = parse_estimated_time_from_gcode(final_gcode) or parse_time_from_string_or_filename(final_gcode_name) or 3600
+
+        # Extract thumbnail if 3MF
+        thumb_png = None
+        if input_path.suffix.lower() in (".3mf", ".smf"):
+            thumb_png = extract_thumbnail(input_path, plate_idx=plate_num, thumb_file=pm.get("thumbnail"))
+            if thumb_png:
+                inject_gcode_thumbnails(final_gcode, thumb_png)
+                # Cache thumbnail for this plate
+                save_cached_thumbnail(final_gcode.stem, thumb_png)
+                if is_multi_plate:
+                    save_cached_thumbnail(f"{base_name}_plate_{plate_num}", thumb_png)
+                else:
+                    save_cached_thumbnail(base_name, thumb_png)
+
+        # Upload to CC2 printer via pycentauri CLI (non-fatal if printer is printing/busy)
+        up_cmd = [
+            "centauri", "upload", str(final_gcode),
+            "--host", PRINTER_IP,
+            "--access-code", ACCESS_CODE,
+            "--enable-control",
+        ]
+        print(f"[*] Uploading {final_gcode.name} to CC2 at {PRINTER_IP}...", flush=True)
+        up_proc = subprocess.run(up_cmd, capture_output=True, text=True, timeout=120)
+        upload_ok = (up_proc.returncode == 0)
+        if not upload_ok:
+            print(f"[!] Note: CC2 file upload postponed for {final_gcode.name} (printer busy): {up_proc.stderr}", flush=True)
+
+        plates_result.append({
+            "plate_id": plate_num,
+            "plate_name": pname,
+            "display_name": disp_name,
+            "gcode": final_gcode.name,
+            "filename": final_gcode.name,
+            "slice_time": slice_time,
+            "slice_time_seconds": slice_time,
+            "estimated_seconds": est_seconds,
+            "estimated_formatted": format_duration(est_seconds),
+            "size_bytes": final_gcode.stat().st_size,
+            "uploaded": upload_ok,
+            "thumbnail_b64": base64.b64encode(thumb_png).decode("ascii") if thumb_png else None,
+        })
+
+    first = plates_result[0]
     result = {
         "status": "success",
-        "gcode": final_gcode.name,
-        "filename": final_gcode.name,
+        "is_multi_plate": is_multi_plate,
+        "plates": plates_result,
+        "gcode": first["gcode"],
+        "filename": first["filename"],
         "slice_time": slice_time,
         "slice_time_seconds": slice_time,
-        "estimated_seconds": est_seconds,
-        "estimated_formatted": format_duration(est_seconds),
-        "size_bytes": final_gcode.stat().st_size,
-        "uploaded": upload_ok,
+        "estimated_seconds": first["estimated_seconds"],
+        "estimated_formatted": first["estimated_formatted"],
+        "size_bytes": first["size_bytes"],
+        "uploaded": first["uploaded"],
         "printer_ip": PRINTER_IP,
     }
-    if thumb_png:
-        result["thumbnail_b64"] = base64.b64encode(thumb_png).decode("ascii")
+    if first.get("thumbnail_b64"):
+        result["thumbnail_b64"] = first["thumbnail_b64"]
     return result
 
 
@@ -1129,6 +1244,14 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                             if data:
                                 save_cached_thumbnail(base_name, data)
                                 break
+                    if not data:
+                        m_p = re.search(r"^(.*)_plate_(\d+)$", base_name, re.IGNORECASE)
+                        if m_p:
+                            parent_mf = UPLOAD_DIR / f"{m_p.group(1)}.3mf"
+                            if parent_mf.exists() and parent_mf.is_file():
+                                data = extract_thumbnail(parent_mf, plate_idx=int(m_p.group(2)))
+                                if data:
+                                    save_cached_thumbnail(base_name, data)
 
                 # If still not found, fetch live from CC2 printer storage via SDCP method 1045
                 if not data:
@@ -1334,7 +1457,7 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
             upload_dir.mkdir(parents=True, exist_ok=True)
 
             # Determine clean filename and display_name
-            raw_fn = Path(filename).name.strip() if filename else ""
+            raw_fn = sanitize_filename(Path(filename).name.strip()) if filename else ""
             is_generic = not raw_fn or raw_fn.lower() in (
                 "model.stl", "model.3mf", "model.gcode", "model",
                 "shortcut input.stl", "shortcut input.3mf", "shortcut input",
@@ -1350,13 +1473,14 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 temp_inspect.unlink(missing_ok=True)
 
                 if is_generic and extracted_title:
-                    filename = f"{extracted_title}.3mf"
-                    display_name = extracted_title
+                    clean_title = sanitize_filename(extracted_title)
+                    filename = f"{clean_title}.3mf"
+                    display_name = clean_title
                 elif is_generic:
                     filename = f"model_{int(time.time())}.3mf"
                     display_name = "3D Model"
                 else:
-                    clean_stem = re.sub(r"\.(stl|3mf|smf|gcode)$", "", raw_fn, flags=re.IGNORECASE).strip()
+                    clean_stem = sanitize_filename(re.sub(r"\.(stl|3mf|smf|gcode)$", "", raw_fn, flags=re.IGNORECASE).strip())
                     filename = f"{clean_stem}.3mf"
                     display_name = clean_stem
 
@@ -1372,7 +1496,7 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                         filename = f"model_{int(time.time())}.gcode"
                         display_name = "G-code Job"
                 else:
-                    clean_stem = re.sub(r"\.(stl|3mf|smf|gcode)$", "", raw_fn, flags=re.IGNORECASE).strip()
+                    clean_stem = sanitize_filename(re.sub(r"\.(stl|3mf|smf|gcode)$", "", raw_fn, flags=re.IGNORECASE).strip())
                     filename = f"{clean_stem}.gcode"
                     display_name = clean_stem
 
@@ -1382,8 +1506,9 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                     if file_data.startswith(b"solid "):
                         hdr_name = file_data[:80].decode("utf-8", errors="ignore").split("\n")[0][6:].strip()
                         if hdr_name and hdr_name.lower() not in ("default", "model", "ascii", "solid", "openscad_model"):
-                            filename = f"{hdr_name}.stl"
-                            display_name = hdr_name
+                            clean_hdr = sanitize_filename(hdr_name)
+                            filename = f"{clean_hdr}.stl"
+                            display_name = clean_hdr
                         else:
                             filename = f"model_{int(time.time())}.stl"
                             display_name = "3D Model"
@@ -1391,7 +1516,7 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                         filename = f"model_{int(time.time())}.stl"
                         display_name = "3D Model"
                 else:
-                    clean_stem = re.sub(r"\.(stl|3mf|smf|gcode)$", "", raw_fn, flags=re.IGNORECASE).strip()
+                    clean_stem = sanitize_filename(re.sub(r"\.(stl|3mf|smf|gcode)$", "", raw_fn, flags=re.IGNORECASE).strip())
                     filename = f"{clean_stem}.stl"
                     display_name = clean_stem
 
@@ -1436,69 +1561,168 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
             # If 3MF or STL:
             if auto_queue:
                 base_name = re.sub(r"\.(stl|3mf|smf)$", "", filename, flags=re.IGNORECASE)
-                # Pre-extract thumbnail if 3MF
-                if is_3mf:
-                    try:
-                        thumb_data = extract_thumbnail(saved_path)
-                        if thumb_data:
-                            save_cached_thumbnail(base_name, thumb_data)
-                    except Exception:
-                        pass
+
+                plates_meta = get_3mf_plates(saved_path) if is_3mf else []
+                is_multi_plate = len(plates_meta) > 1
 
                 resolved_tray, _ = resolve_tray_and_canvas(slot=param_slot, filament=param_filament)
                 resolved_slot = param_slot or f"A{resolved_tray + 1}"
 
-                job_id = f"job_{int(time.time() * 1000)}"
-                initial_job = {
-                    "id": job_id,
-                    "filename": f"{base_name}.gcode",
-                    "display_name": display_name,
-                    "filament": param_filament or "PLA",
-                    "slot": resolved_slot,
-                    "tray_id": resolved_tray,
-                    "plate": param_plate or "A",
-                    "auto_level": auto_level,
-                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "slice_time_seconds": None,
-                    "estimated_seconds": parse_time_from_string_or_filename(filename) or 3600,
-                    "estimated_formatted": "Slicing on N100...",
-                    "filesize": f"{round(len(file_data) / (1024*1024), 2)} MB",
-                    "status": "slicing",
-                }
+                # Pre-extract thumbnail(s) if 3MF
+                if is_3mf:
+                    try:
+                        if is_multi_plate:
+                            for pm in plates_meta:
+                                pid = pm["id"]
+                                tdata = extract_thumbnail(saved_path, plate_idx=pid, thumb_file=pm.get("thumbnail"))
+                                if tdata:
+                                    save_cached_thumbnail(f"{base_name}_plate_{pid}", tdata)
+                        else:
+                            thumb_data = extract_thumbnail(saved_path)
+                            if thumb_data:
+                                save_cached_thumbnail(base_name, thumb_data)
+                    except Exception as e:
+                        print(f"[!] Warning caching thumbnail for {filename}: {e}", flush=True)
+
+                initial_jobs = []
+                now_ms = int(time.time() * 1000)
+
+                if is_multi_plate:
+                    for pm in plates_meta:
+                        pid = pm["id"]
+                        pname = pm.get("name", "").strip()
+                        if pname and pname.lower() != base_name.lower():
+                            pdisp = f"{display_name} - {pname}"
+                        else:
+                            pdisp = f"{display_name} - Plate {pid}"
+                        p_job_id = f"job_{now_ms}_{pid}"
+                        p_job = {
+                            "id": p_job_id,
+                            "plate_id": pid,
+                            "filename": f"{base_name}_plate_{pid}.gcode",
+                            "display_name": pdisp,
+                            "filament": param_filament or "PLA",
+                            "slot": resolved_slot,
+                            "tray_id": resolved_tray,
+                            "plate": param_plate or "A",
+                            "auto_level": auto_level,
+                            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "slice_time_seconds": None,
+                            "estimated_seconds": parse_time_from_string_or_filename(filename) or 3600,
+                            "estimated_formatted": "Slicing on N100...",
+                            "filesize": f"{round(len(file_data) / (1024*1024), 2)} MB",
+                            "status": "slicing",
+                        }
+                        initial_jobs.append(p_job)
+                else:
+                    job_id = f"job_{now_ms}"
+                    initial_job = {
+                        "id": job_id,
+                        "filename": f"{base_name}.gcode",
+                        "display_name": display_name,
+                        "filament": param_filament or "PLA",
+                        "slot": resolved_slot,
+                        "tray_id": resolved_tray,
+                        "plate": param_plate or "A",
+                        "auto_level": auto_level,
+                        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "slice_time_seconds": None,
+                        "estimated_seconds": parse_time_from_string_or_filename(filename) or 3600,
+                        "estimated_formatted": "Slicing on N100...",
+                        "filesize": f"{round(len(file_data) / (1024*1024), 2)} MB",
+                        "status": "slicing",
+                    }
+                    initial_jobs.append(initial_job)
+
                 queue = load_queue()
-                queue.append(initial_job)
+                queue.extend(initial_jobs)
                 save_queue(queue)
 
-                def _bg_slice_task(fpath: Path, jid: str, bname: str):
-                    print(f"[*] Background slicing started for {fpath.name} ({jid})...", flush=True)
+                expected_jids = [j["id"] for j in initial_jobs]
+
+                def _bg_slice_task(fpath: Path, expected_ids: list[str], bname: str, clean_disp: str):
+                    print(f"[*] Background slicing started for {fpath.name} (jobs: {expected_ids})...", flush=True)
                     try:
                         s_res = slice_and_upload(fpath)
-                        print(f"[+] Background slicing succeeded for {fpath.name}: {s_res.get('gcode')}", flush=True)
+                        print(f"[+] Background slicing succeeded for {fpath.name}", flush=True)
                         q = load_queue()
-                        for it in q:
-                            if it.get("id") == jid:
-                                it["filename"] = s_res.get("gcode") or f"{bname}.gcode"
-                                it["status"] = "queued"
-                                it["slice_time_seconds"] = s_res.get("slice_time")
-                                est = s_res.get("estimated_seconds") or parse_time_from_string_or_filename(fpath.name) or 3600
-                                it["estimated_seconds"] = est
-                                it["estimated_formatted"] = format_duration(est)
-                                break
+                        plates_res = s_res.get("plates", [])
+                        if s_res.get("is_multi_plate") and plates_res:
+                            for pl in plates_res:
+                                pid = pl.get("plate_id")
+                                pl_gcode = pl.get("gcode") or f"{bname}_plate_{pid}.gcode"
+                                pl_disp = pl.get("display_name") or f"{clean_disp} - Plate {pid}"
+                                pl_est = pl.get("estimated_seconds") or 3600
+                                pl_slice = pl.get("slice_time_seconds") or s_res.get("slice_time")
+
+                                matched = False
+                                for it in q:
+                                    if (it.get("id") in expected_ids and it.get("plate_id") == pid) or it.get("filename") == pl_gcode:
+                                        it["filename"] = pl_gcode
+                                        it["display_name"] = pl_disp
+                                        it["status"] = "queued"
+                                        it["slice_time_seconds"] = pl_slice
+                                        it["estimated_seconds"] = pl_est
+                                        it["estimated_formatted"] = format_duration(pl_est)
+                                        matched = True
+                                        break
+                                if not matched:
+                                    # Fallback: check if an initial placeholder with status 'slicing' matches
+                                    for it in q:
+                                        if it.get("id") in expected_ids and it.get("status") == "slicing":
+                                            it["plate_id"] = pid
+                                            it["filename"] = pl_gcode
+                                            it["display_name"] = pl_disp
+                                            it["status"] = "queued"
+                                            it["slice_time_seconds"] = pl_slice
+                                            it["estimated_seconds"] = pl_est
+                                            it["estimated_formatted"] = format_duration(pl_est)
+                                            matched = True
+                                            break
+                                    if not matched:
+                                        # Append extra plate job
+                                        q.append({
+                                            "id": f"job_{int(time.time() * 1000)}_{pid}",
+                                            "plate_id": pid,
+                                            "filename": pl_gcode,
+                                            "display_name": pl_disp,
+                                            "filament": param_filament or "PLA",
+                                            "slot": resolved_slot,
+                                            "tray_id": resolved_tray,
+                                            "plate": param_plate or "A",
+                                            "auto_level": auto_level,
+                                            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                            "slice_time_seconds": pl_slice,
+                                            "estimated_seconds": pl_est,
+                                            "estimated_formatted": format_duration(pl_est),
+                                            "filesize": f"{round(fpath.stat().st_size / (1024*1024), 2)} MB",
+                                            "status": "queued",
+                                        })
+                        else:
+                            gcode_fn = s_res.get("gcode") or f"{bname}.gcode"
+                            est = s_res.get("estimated_seconds") or parse_time_from_string_or_filename(fpath.name) or 3600
+                            for it in q:
+                                if it.get("id") in expected_ids or it.get("filename") == gcode_fn:
+                                    it["filename"] = gcode_fn
+                                    it["status"] = "queued"
+                                    it["slice_time_seconds"] = s_res.get("slice_time")
+                                    it["estimated_seconds"] = est
+                                    it["estimated_formatted"] = format_duration(est)
+                                    break
                         save_queue(q)
                     except Exception as ex:
                         print(f"[!] Background slicing failed for {fpath.name}: {ex}", flush=True)
                         q = load_queue()
                         for it in q:
-                            if it.get("id") == jid:
+                            if it.get("id") in expected_ids:
                                 it["status"] = "error"
                                 it["estimated_formatted"] = "Slicing failed"
                                 it["error"] = str(ex)
-                                break
                         save_queue(q)
 
                 threading.Thread(
                     target=_bg_slice_task,
-                    args=(saved_path, job_id, base_name),
+                    args=(saved_path, expected_jids, base_name, display_name),
                     daemon=True,
                 ).start()
 
@@ -1508,8 +1732,10 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({
                     "status": "success",
                     "queued": True,
-                    "message": f"'{display_name}' received! Slicing in background on N100 and queued to CC2.",
-                    "job": initial_job,
+                    "is_multi_plate": is_multi_plate,
+                    "message": f"'{display_name}' ({len(initial_jobs)} plate{'s' if len(initial_jobs) > 1 else ''}) received! Slicing in background on N100 and queued to CC2.",
+                    "job": initial_jobs[0],
+                    "jobs": initial_jobs,
                     "filename": filename,
                     "display_name": display_name,
                 }).encode())

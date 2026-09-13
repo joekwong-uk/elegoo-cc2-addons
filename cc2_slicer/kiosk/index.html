@@ -632,19 +632,38 @@
 
           btn.innerHTML = '<i class="fa-solid fa-check"></i><span>Success! Queued</span>';
 
-          // Auto add to queue
-          await authFetch(`${SLICER_SERVICE_URL}/queue`, {
-            method: "POST",
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              action: "add",
-              filename: result.gcode || result.filename,
-              filament: document.getElementById('filamentSelect').value,
-              plate: document.getElementById('plateSelect').value,
-              slice_time_seconds: isGcode ? 0 : (result.slice_time || result.slice_time_seconds || 0),
-              estimated_seconds: result.estimated_seconds || 5400
-            })
-          });
+          // Auto add to queue (multi-plate or single)
+          if (result.is_multi_plate && Array.isArray(result.plates) && result.plates.length > 0) {
+            for (const pl of result.plates) {
+              await authFetch(`${SLICER_SERVICE_URL}/queue`, {
+                method: "POST",
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  action: "add",
+                  filename: pl.gcode || pl.filename,
+                  display_name: pl.display_name,
+                  filament: document.getElementById('filamentSelect').value,
+                  plate: document.getElementById('plateSelect').value,
+                  slice_time_seconds: isGcode ? 0 : (pl.slice_time || pl.slice_time_seconds || 0),
+                  estimated_seconds: pl.estimated_seconds || 5400
+                })
+              });
+            }
+          } else {
+            await authFetch(`${SLICER_SERVICE_URL}/queue`, {
+              method: "POST",
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                action: "add",
+                filename: result.gcode || result.filename,
+                display_name: result.display_name,
+                filament: document.getElementById('filamentSelect').value,
+                plate: document.getElementById('plateSelect').value,
+                slice_time_seconds: isGcode ? 0 : (result.slice_time || result.slice_time_seconds || 0),
+                estimated_seconds: result.estimated_seconds || 5400
+              })
+            });
+          }
 
           refreshQueue();
         } else {
