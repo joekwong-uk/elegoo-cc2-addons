@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -591,6 +592,22 @@ def slice_and_upload(input_path: Path) -> dict:
         if not upload_ok:
             print(f"[!] Note: CC2 file upload postponed for {final_gcode.name} (printer busy): {up_proc.stderr}", flush=True)
 
+        # Check if multi-color from 3MF metadata and generated G-code
+        insp_3mf = inspect_3mf_filaments(input_path, plate_idx=plate_num) if input_path.suffix.lower() in (".3mf", ".smf") else {"is_multi_color": False, "filaments": []}
+        insp_gcode = inspect_gcode_filaments(final_gcode)
+        if insp_3mf.get("is_multi_color"):
+            insp_plate = insp_3mf
+        elif insp_gcode.get("is_multi_color"):
+            insp_plate = insp_gcode
+        elif insp_3mf.get("filaments"):
+            insp_plate = insp_3mf
+        else:
+            insp_plate = insp_gcode
+
+        is_mc = insp_plate.get("is_multi_color", False)
+        fils_req = insp_plate.get("filaments", [])
+        s_map = auto_match_filaments_to_ams(fils_req) if is_mc else []
+
         plates_result.append({
             "plate_id": plate_num,
             "plate_name": pname,
@@ -604,6 +621,9 @@ def slice_and_upload(input_path: Path) -> dict:
             "size_bytes": final_gcode.stat().st_size,
             "uploaded": upload_ok,
             "thumbnail_b64": base64.b64encode(thumb_png).decode("ascii") if thumb_png else None,
+            "is_multi_color": is_mc,
+            "filaments_required": fils_req,
+            "slot_map": s_map,
         })
 
     first = plates_result[0]
@@ -620,6 +640,9 @@ def slice_and_upload(input_path: Path) -> dict:
         "size_bytes": first["size_bytes"],
         "uploaded": first["uploaded"],
         "printer_ip": PRINTER_IP,
+        "is_multi_color": first.get("is_multi_color", False),
+        "filaments_required": first.get("filaments_required", []),
+        "slot_map": first.get("slot_map", []),
     }
     if first.get("thumbnail_b64"):
         result["thumbnail_b64"] = first["thumbnail_b64"]
@@ -680,6 +703,11 @@ def process_gcode_upload(input_path: Path) -> dict[str, Any]:
         print(f"[!] Warning: upload to printer reported: {up_proc.stderr}", flush=True)
 
     elapsed = round(time.time() - t0, 1)
+    g_insp = inspect_gcode_filaments(final_gcode)
+    is_mc = g_insp.get("is_multi_color", False)
+    fils_req = g_insp.get("filaments", [])
+    s_map = auto_match_filaments_to_ams(fils_req) if is_mc else []
+
     result = {
         "status": "success",
         "is_gcode": True,
@@ -692,6 +720,9 @@ def process_gcode_upload(input_path: Path) -> dict[str, Any]:
         "size_bytes": final_gcode.stat().st_size,
         "uploaded": upload_ok,
         "printer_ip": PRINTER_IP,
+        "is_multi_color": is_mc,
+        "filaments_required": fils_req,
+        "slot_map": s_map,
     }
     if thumb_png:
         result["thumbnail_b64"] = base64.b64encode(thumb_png).decode("ascii")
@@ -920,6 +951,287 @@ def resolve_tray_and_canvas(slot: str | None = None, filament: str | None = None
     return (0, 0)
 
 
+def hex_to_rgb(hex_str: str | None) -> tuple[int, int, int]:
+    """Convert hex color string (#RRGGBB) to (R, G, B) integer tuple."""
+    if not hex_str or not str(hex_str).startswith("#") or len(str(hex_str)) < 7:
+        return (128, 128, 128)
+    try:
+        h = str(hex_str).lstrip("#")
+        return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+    except Exception:
+        return (128, 128, 128)
+
+
+def inspect_3mf_filaments(archive_path: Path | str, plate_idx: int | None = None) -> dict[str, Any]:
+    """
+    Extract required filaments, colors, and extruder mappings from a 3MF project.
+    Inspects Metadata/project_settings.config and Metadata/model_settings.config.
+    """
+    filaments_required: list[dict[str, Any]] = []
+    try:
+        archive_path = Path(archive_path)
+        if not archive_path.exists():
+            return {"is_multi_color": False, "filaments": []}
+
+        with zipfile.ZipFile(archive_path, "r") as z:
+            names = z.namelist()
+            colors: list[str] = []
+            types: list[str] = []
+            vendors: list[str] = []
+            if "Metadata/project_settings.config" in names:
+                try:
+                    cfg = json.loads(z.read("Metadata/project_settings.config").decode("utf-8", errors="ignore"))
+                    colors = cfg.get("filament_colour") or cfg.get("filament_multi_colour") or []
+                    types = cfg.get("filament_type") or []
+                    vendors = cfg.get("filament_vendor") or []
+                except Exception as _ce:
+                    print(f"[!] Error parsing 3MF project_settings.config: {_ce}", flush=True)
+
+            used_extruders: set[int] = set()
+            if "Metadata/model_settings.config" in names:
+                try:
+                    xml_str = z.read("Metadata/model_settings.config").decode("utf-8", errors="ignore")
+                    root = ET.fromstring(xml_str)
+
+                    # Identify target objects for the specified plate
+                    target_objects: set[str] = set()
+                    for pl in root.findall(".//plate"):
+                        pid = None
+                        for m in pl.findall("metadata"):
+                            if m.get("key") == "plater_id":
+                                v = m.get("value", "")
+                                pid = int(v) if v.isdigit() else v
+                        if plate_idx is None or pid == plate_idx:
+                            for mi in pl.findall(".//model_instance"):
+                                for m in mi.findall("metadata"):
+                                    if m.get("key") == "object_id" and m.get("value"):
+                                        target_objects.add(m.get("value"))
+
+                    for obj in root.findall(".//object"):
+                        oid = obj.get("id")
+                        if target_objects and oid not in target_objects:
+                            continue
+                        obj_ext = 1
+                        for m in obj.findall("metadata"):
+                            if m.get("key") == "extruder" and m.get("value", "").isdigit():
+                                obj_ext = int(m.get("value"))
+
+                        parts_found = False
+                        for part in obj.findall(".//part"):
+                            part_ext = None
+                            for m in part.findall("metadata"):
+                                if m.get("key") == "extruder" and m.get("value", "").isdigit():
+                                    part_ext = int(m.get("value"))
+                            if part_ext is not None:
+                                used_extruders.add(part_ext)
+                            else:
+                                used_extruders.add(obj_ext)
+                            parts_found = True
+                        if not parts_found:
+                            used_extruders.add(obj_ext)
+                except Exception as _me:
+                    print(f"[!] Error parsing 3MF model_settings.config: {_me}", flush=True)
+
+            if not used_extruders:
+                used_extruders = {1}
+
+            for ext in sorted(used_extruders):
+                idx = ext - 1
+                c = colors[idx] if idx < len(colors) and colors[idx] else "#FFFFFF"
+                t = types[idx] if idx < len(types) and types[idx] else "PLA"
+                v = vendors[idx] if idx < len(vendors) and vendors[idx] else "ELEGOO"
+                c_name = approx_color_name(c)
+                filaments_required.append({
+                    "tool": idx,
+                    "extruder": ext,
+                    "color": c,
+                    "color_name": c_name,
+                    "type": t,
+                    "vendor": v,
+                })
+    except Exception as e:
+        print(f"[!] inspect_3mf_filaments error: {e}", flush=True)
+
+    is_multi_color = len(filaments_required) > 1
+    return {"is_multi_color": is_multi_color, "filaments": filaments_required}
+
+
+def inspect_gcode_filaments(gcode_path: Path | str) -> dict[str, Any]:
+    """
+    Extract required filaments and tool mappings from G-code comments and tool change commands.
+    """
+    filaments_required: list[dict[str, Any]] = []
+    try:
+        gcode_path = Path(gcode_path)
+        if not gcode_path.exists():
+            return {"is_multi_color": False, "filaments": []}
+
+        colors: list[str] = []
+        types: list[str] = []
+        vendors: list[str] = []
+        tools_used: set[int] = set()
+
+        # Read first 1500 lines for metadata and initial tool commands
+        with open(gcode_path, "r", encoding="utf-8", errors="replace") as f:
+            head_lines = [f.readline() for _ in range(1500)]
+
+        for line in head_lines:
+            ls = line.strip()
+            if ls.startswith(";"):
+                if "filament_colour" in ls or "filament_color" in ls:
+                    val = ls.split("=", 1)[1].strip() if "=" in ls else ""
+                    parts = [p.strip().strip('"\'') for p in re.split(r"[;,]", val) if p.strip()]
+                    if parts:
+                        colors = parts
+                elif "filament_type" in ls:
+                    val = ls.split("=", 1)[1].strip() if "=" in ls else ""
+                    parts = [p.strip().strip('"\'') for p in re.split(r"[;,]", val) if p.strip()]
+                    if parts:
+                        types = parts
+                elif "filament_vendor" in ls:
+                    val = ls.split("=", 1)[1].strip() if "=" in ls else ""
+                    parts = [p.strip().strip('"\'') for p in re.split(r"[;,]", val) if p.strip()]
+                    if parts:
+                        vendors = parts
+            elif re.match(r"^T(\d+)", ls):
+                m_t = re.match(r"^T(\d+)", ls)
+                if m_t:
+                    tools_used.add(int(m_t.group(1)))
+
+        # Also inspect tail lines for OrcaSlicer CONFIG_BLOCK
+        try:
+            with open(gcode_path, "rb") as bf:
+                bf.seek(0, 2)
+                size = bf.tell()
+                tail_size = min(size, 65536)
+                bf.seek(size - tail_size)
+                tail_txt = bf.read().decode("utf-8", errors="ignore")
+                for line in tail_txt.splitlines():
+                    ls = line.strip()
+                    if ls.startswith(";"):
+                        if not colors and ("filament_colour" in ls or "filament_color" in ls):
+                            val = ls.split("=", 1)[1].strip() if "=" in ls else ""
+                            parts = [p.strip().strip('"\'') for p in re.split(r"[;,]", val) if p.strip()]
+                            if parts:
+                                colors = parts
+                        elif not types and "filament_type" in ls:
+                            val = ls.split("=", 1)[1].strip() if "=" in ls else ""
+                            parts = [p.strip().strip('"\'') for p in re.split(r"[;,]", val) if p.strip()]
+                            if parts:
+                                types = parts
+                        elif not vendors and "filament_vendor" in ls:
+                            val = ls.split("=", 1)[1].strip() if "=" in ls else ""
+                            parts = [p.strip().strip('"\'') for p in re.split(r"[;,]", val) if p.strip()]
+                            if parts:
+                                vendors = parts
+        except Exception:
+            pass
+
+        if not tools_used:
+            if len(colors) > 1:
+                with open(gcode_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if line.startswith("T") and len(line) <= 5:
+                            m_t = re.match(r"^T(\d+)", line)
+                            if m_t:
+                                tools_used.add(int(m_t.group(1)))
+            else:
+                tools_used = {0}
+
+        if not tools_used:
+            tools_used = {0}
+
+        for t in sorted(tools_used):
+            c = colors[t] if t < len(colors) and colors[t] else "#FFFFFF"
+            ftype = types[t] if t < len(types) and types[t] else "PLA"
+            v = vendors[t] if t < len(vendors) and vendors[t] else "ELEGOO"
+            c_name = approx_color_name(c)
+            filaments_required.append({
+                "tool": t,
+                "extruder": t + 1,
+                "color": c,
+                "color_name": c_name,
+                "type": ftype,
+                "vendor": v,
+            })
+    except Exception as e:
+        print(f"[!] inspect_gcode_filaments error: {e}", flush=True)
+
+    is_multi_color = len(filaments_required) > 1
+    return {"is_multi_color": is_multi_color, "filaments": filaments_required}
+
+
+def auto_match_filaments_to_ams(
+    filaments_required: list[dict[str, Any]],
+    ams_details: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Auto-match each required model filament/tool to the best loaded AMS slot.
+    Uses Euclidean RGB distance + material type matching bonus.
+    Ensures distinct slots are prioritized for different tools.
+    """
+    if ams_details is None:
+        ams_details = get_ams_details()
+
+    slot_map: list[dict[str, Any]] = []
+    used_slots: set[str] = set()
+
+    for req in filaments_required:
+        tool_idx = req.get("tool", 0)
+        req_color = req.get("color", "#FFFFFF")
+        req_type = (req.get("type") or "PLA").strip().upper()
+        req_name = req.get("color_name") or approx_color_name(req_color)
+
+        r1, g1, b1 = hex_to_rgb(req_color)
+
+        best_slot_key = None
+        best_score = float("inf")
+
+        for slot_key, slot_info in ams_details.items():
+            is_loaded = slot_info.get("is_loaded", True)
+            slot_color = slot_info.get("color", "#808080")
+            slot_type = (slot_info.get("type") or slot_info.get("name") or "").strip().upper()
+
+            r2, g2, b2 = hex_to_rgb(slot_color)
+            color_dist = math.sqrt((r1 - r2) ** 2 + (g1 - g2) ** 2 + (b1 - b2) ** 2)
+
+            score = color_dist
+            # Penalty for empty/unloaded slot
+            if not is_loaded:
+                score += 1000.0
+            # Penalty for reusing a slot already assigned to another tool
+            if slot_key in used_slots:
+                score += 80.0
+            # Material match bonus
+            if req_type in slot_type or slot_type in req_type:
+                score -= 25.0
+
+            if score < best_score:
+                best_score = score
+                best_slot_key = slot_key
+
+        if not best_slot_key:
+            best_slot_key = "A1"
+
+        chosen = ams_details.get(best_slot_key, {})
+        used_slots.add(best_slot_key)
+
+        slot_map.append({
+            "t": tool_idx,
+            "canvas_id": chosen.get("canvas_id", 0),
+            "tray_id": chosen.get("tray_id", 0),
+            "slot": best_slot_key,
+            "slot_name": best_slot_key,
+            "slot_color": chosen.get("color", "#808080"),
+            "slot_filament": chosen.get("name", "PLA"),
+            "req_color": req_color,
+            "req_color_name": req_name,
+            "req_type": req.get("type", "PLA"),
+        })
+
+    return slot_map
+
+
 def save_cached_thumbnail(base_name: str, data: bytes) -> None:
     """Save thumbnail PNG into all relevant caching locations."""
     if not data:
@@ -968,6 +1280,9 @@ def add_job_to_queue(
     display_name: str | None = None,
     auto_level: bool = True,
     filesize: str = "",
+    is_multi_color: bool = False,
+    filaments_required: list[dict[str, Any]] | None = None,
+    slot_map: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Helper to construct, enrich, and append a print job to the persistent queue."""
     queue = load_queue()
@@ -987,6 +1302,17 @@ def add_job_to_queue(
         tdata = fetch_thumbnail_from_printer(filename)
         if tdata:
             save_cached_thumbnail(base_name, tdata)
+
+    if filaments_required and len(filaments_required) > 1:
+        is_multi_color = True
+    if is_multi_color and not slot_map and filaments_required:
+        slot_map = auto_match_filaments_to_ams(filaments_required)
+
+    if slot_map and len(slot_map) > 0:
+        if tray_id is None:
+            tray_id = int(slot_map[0].get("tray_id", 0))
+        if not slot:
+            slot = slot_map[0].get("slot") or f"A{tray_id + 1}"
 
     # Resolve slot & tray_id if not explicitly provided
     if tray_id is None:
@@ -1009,6 +1335,9 @@ def add_job_to_queue(
         "estimated_formatted": format_duration(est),
         "filesize": filesize,
         "status": "queued",
+        "is_multi_color": bool(is_multi_color),
+        "filaments_required": filaments_required or [],
+        "slot_map": slot_map or [],
     }
     queue.append(job)
     save_queue(queue)
@@ -1075,15 +1404,24 @@ def execute_cc2_start_print(
     filament: str | None = None,
     auto_leveling: bool = True,
     timelapse: bool = False,
+    slot_map: list[dict[str, Any]] | None = None,
 ) -> tuple[bool, str]:
     """
     Start a print on Elegoo CC2 ensuring exact plate, slot, and tray mapping are sent.
+    Supports multi-color slot_map mapping for method 1020.
     Returns (success: bool, message: str).
     """
+    if slot_map and len(slot_map) > 0:
+        if tray_id is None:
+            tray_id = int(slot_map[0].get("tray_id", 0))
+            canvas_id = int(slot_map[0].get("canvas_id", 0))
+        if not slot:
+            slot = slot_map[0].get("slot") or f"A{tray_id + 1}"
+
     if tray_id is None:
         tray_id, canvas_id = resolve_tray_and_canvas(slot=slot, filament=filament)
 
-    print(f"[CC2] execute_cc2_start_print: filename={filename}, plate={plate}, slot={slot}, tray_id={tray_id}, canvas_id={canvas_id}, auto_leveling={auto_leveling}, timelapse={timelapse}", flush=True)
+    print(f"[CC2] execute_cc2_start_print: filename={filename}, plate={plate}, slot={slot}, tray_id={tray_id}, canvas_id={canvas_id}, slot_map={slot_map}, auto_leveling={auto_leveling}, timelapse={timelapse}", flush=True)
 
     # Ensure file is uploaded to CC2 printer storage if present in local cc2_output
     local_path = OUTPUT_DIR / filename
@@ -1120,6 +1458,7 @@ def execute_cc2_start_print(
                 plate=plate,
                 tray_id=tray_id,
                 canvas_id=canvas_id,
+                slot_map=slot_map,
             )
             return res.inner if hasattr(res, "inner") else res
 
@@ -1127,7 +1466,8 @@ def execute_cc2_start_print(
         res = asyncio.run(_run())
         err = res.get("error_code") if isinstance(res, dict) else 0
         if err == 0:
-            return True, f"Print started successfully for {filename} (Plate {plate}, Slot A{tray_id+1})"
+            slot_desc = f"Slot A{tray_id+1}" if not slot_map or len(slot_map) <= 1 else f"Multi-Color ({len(slot_map)} slots)"
+            return True, f"Print started successfully for {filename} (Plate {plate}, {slot_desc})"
         else:
             return False, f"CC2 returned error_code {err}: {res}"
     except Exception as e:
@@ -1241,6 +1581,16 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                     item_copy["slot_color"] = "#808080"
                     item_copy["slot_color_name"] = ""
                     item_copy["slot_brand"] = ""
+
+                # Enrich multi-color slot_map entries with live loaded slot info
+                if item_copy.get("is_multi_color") and item_copy.get("slot_map"):
+                    for sm in item_copy["slot_map"]:
+                        sm_slot = sm.get("slot", "")
+                        sm_detail = ams_details.get(sm_slot, {})
+                        if sm_detail:
+                            sm["slot_color"] = sm_detail.get("color", sm.get("slot_color", "#808080"))
+                            sm["slot_filament"] = sm_detail.get("name", sm.get("slot_filament", "PLA"))
+                            sm["is_loaded"] = sm_detail.get("is_loaded", True)
 
                 if item.get("status") != "printing":
                     total_eta += est
@@ -1701,6 +2051,9 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                             slice_time_seconds=res.get("slice_time") or res.get("slice_time_seconds"),
                             display_name=display_name,
                             filesize=f"{round(len(file_data) / (1024*1024), 2)} MB",
+                            is_multi_color=res.get("is_multi_color", False),
+                            filaments_required=res.get("filaments_required", []),
+                            slot_map=res.get("slot_map", []),
                         )
                         res["queued"] = True
                         res["job"] = job
@@ -1756,6 +2109,10 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                         else:
                             pdisp = f"{display_name} - Plate {pid}"
                         p_job_id = f"job_{now_ms}_{pid}"
+                        insp = inspect_3mf_filaments(saved_path, plate_idx=pid) if is_3mf else {"is_multi_color": False, "filaments": []}
+                        mc = insp.get("is_multi_color", False)
+                        fils = insp.get("filaments", [])
+                        sm = auto_match_filaments_to_ams(fils) if mc else []
                         p_job = {
                             "id": p_job_id,
                             "plate_id": pid,
@@ -1772,10 +2129,17 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                             "estimated_formatted": "Slicing on N100...",
                             "filesize": f"{round(len(file_data) / (1024*1024), 2)} MB",
                             "status": "slicing",
+                            "is_multi_color": mc,
+                            "filaments_required": fils,
+                            "slot_map": sm,
                         }
                         initial_jobs.append(p_job)
                 else:
                     job_id = f"job_{now_ms}"
+                    insp = inspect_3mf_filaments(saved_path) if is_3mf else {"is_multi_color": False, "filaments": []}
+                    mc = insp.get("is_multi_color", False)
+                    fils = insp.get("filaments", [])
+                    sm = auto_match_filaments_to_ams(fils) if mc else []
                     initial_job = {
                         "id": job_id,
                         "filename": f"{base_name}.gcode",
@@ -1791,6 +2155,9 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                         "estimated_formatted": "Slicing on N100...",
                         "filesize": f"{round(len(file_data) / (1024*1024), 2)} MB",
                         "status": "slicing",
+                        "is_multi_color": mc,
+                        "filaments_required": fils,
+                        "slot_map": sm,
                     }
                     initial_jobs.append(initial_job)
 
@@ -1815,6 +2182,10 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                                 pl_est = pl.get("estimated_seconds") or 3600
                                 pl_slice = pl.get("slice_time_seconds") or s_res.get("slice_time")
 
+                                pl_multi = pl.get("is_multi_color", False)
+                                pl_fils = pl.get("filaments_required", [])
+                                pl_slot_map = pl.get("slot_map", [])
+
                                 matched = False
                                 for it in q:
                                     if (it.get("id") in expected_ids and it.get("plate_id") == pid) or it.get("filename") == pl_gcode:
@@ -1824,6 +2195,9 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                                         it["slice_time_seconds"] = pl_slice
                                         it["estimated_seconds"] = pl_est
                                         it["estimated_formatted"] = format_duration(pl_est)
+                                        it["is_multi_color"] = pl_multi
+                                        it["filaments_required"] = pl_fils
+                                        it["slot_map"] = pl_slot_map
                                         matched = True
                                         break
                                 if not matched:
@@ -1837,6 +2211,9 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                                             it["slice_time_seconds"] = pl_slice
                                             it["estimated_seconds"] = pl_est
                                             it["estimated_formatted"] = format_duration(pl_est)
+                                            it["is_multi_color"] = pl_multi
+                                            it["filaments_required"] = pl_fils
+                                            it["slot_map"] = pl_slot_map
                                             matched = True
                                             break
                                     if not matched:
@@ -1857,10 +2234,16 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                                             "estimated_formatted": format_duration(pl_est),
                                             "filesize": f"{round(fpath.stat().st_size / (1024*1024), 2)} MB",
                                             "status": "queued",
+                                            "is_multi_color": pl_multi,
+                                            "filaments_required": pl_fils,
+                                            "slot_map": pl_slot_map,
                                         })
                         else:
                             gcode_fn = s_res.get("gcode") or f"{bname}.gcode"
                             est = s_res.get("estimated_seconds") or parse_time_from_string_or_filename(fpath.name) or 3600
+                            mc = s_res.get("is_multi_color", False)
+                            fils = s_res.get("filaments_required", [])
+                            sm = s_res.get("slot_map", [])
                             for it in q:
                                 if it.get("id") in expected_ids or it.get("filename") == gcode_fn:
                                     it["filename"] = gcode_fn
@@ -1868,6 +2251,9 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                                     it["slice_time_seconds"] = s_res.get("slice_time")
                                     it["estimated_seconds"] = est
                                     it["estimated_formatted"] = format_duration(est)
+                                    it["is_multi_color"] = mc
+                                    it["filaments_required"] = fils
+                                    it["slot_map"] = sm
                                     break
                         save_queue(q)
                     except Exception as ex:
@@ -1951,6 +2337,9 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                     display_name=data.get("display_name", fname),
                     auto_level=auto_level,
                     filesize=data.get("filesize", ""),
+                    is_multi_color=bool(data.get("is_multi_color")),
+                    filaments_required=data.get("filaments_required"),
+                    slot_map=data.get("slot_map"),
                 )
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -2030,6 +2419,7 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 target_tray_id = target_job.get("tray_id")
                 target_filament = target_job.get("filament", "PLA")
 
+                target_slot_map = target_job.get("slot_map") if target_job else None
                 ok, msg = execute_cc2_start_print(
                     target_file,
                     plate=target_plate,
@@ -2037,6 +2427,7 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                     tray_id=target_tray_id,
                     filament=target_filament,
                     auto_leveling=target_auto_level,
+                    slot_map=target_slot_map,
                 )
                 if ok:
                     # Move to history
@@ -2068,6 +2459,8 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                         "estimated_seconds": est_sec,
                         "estimated_formatted": format_duration(est_sec),
                         "status": "printing",
+                        "is_multi_color": bool(target_slot_map and len(target_slot_map) > 1),
+                        "slot_map": target_slot_map or [],
                     }
                     history.insert(0, history_entry)
                     save_history(history)
@@ -2155,6 +2548,7 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"error": "Missing filename"}).encode())
                 return
 
+            slot_map = data.get("slot_map") or (target_job.get("slot_map") if target_job else None)
             ok, msg = execute_cc2_start_print(
                 filename,
                 plate=plate,
@@ -2162,6 +2556,7 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 tray_id=tray_id,
                 filament=filament,
                 auto_leveling=auto_level,
+                slot_map=slot_map,
             )
 
             history = load_history()
@@ -2189,6 +2584,8 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 "estimated_seconds": est_sec,
                 "estimated_formatted": format_duration(est_sec),
                 "status": "printing" if ok else "failed",
+                "is_multi_color": bool(slot_map and len(slot_map) > 1),
+                "slot_map": slot_map or [],
             }
             if ok:
                 history.insert(0, history_entry)
@@ -2229,6 +2626,7 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 else:
                     auto_level = True
                 timelapse = bool(data.get("timelapse", False))
+                slot_map = data.get("slot_map")
 
                 ok, msg = execute_cc2_start_print(
                     filename,
@@ -2238,6 +2636,7 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                     filament=filament,
                     auto_leveling=auto_level,
                     timelapse=timelapse,
+                    slot_map=slot_map,
                 )
                 if ok:
                     self.send_response(200)

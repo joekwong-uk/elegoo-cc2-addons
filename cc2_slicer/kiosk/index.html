@@ -340,8 +340,8 @@
         </select>
       </div>
 
-      <!-- Filament / AMS Slot Selector -->
-      <div>
+      <!-- Single Color Filament Selector -->
+      <div id="modalSingleColorSection">
         <label class="block text-[11px] text-gray-400 mb-1 font-semibold">Filament & AMS Slot</label>
         <select id="modalFilamentSelect" onchange="onModalFilamentChange()" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-white text-xs focus:outline-none focus:border-orange-500">
           <!-- Populated with real AMS slots -->
@@ -360,6 +360,21 @@
         <p id="modalFilamentWarning" class="text-[10px] text-amber-400 mt-1 hidden">
           <i class="fa-solid fa-triangle-exclamation mr-1"></i>Notice: Selected slot may not match recommended material.
         </p>
+      </div>
+
+      <!-- Multi-Color AMS Slot Mapping Section -->
+      <div id="modalMultiColorSection" class="hidden space-y-2">
+        <div class="flex items-center justify-between">
+          <label class="text-[11px] text-gray-300 font-semibold flex items-center space-x-1.5">
+            <i class="fa-solid fa-palette text-indigo-400"></i>
+            <span>Multi-Color Filament Mapping</span>
+          </label>
+          <span id="modalMultiColorCountBadge" class="px-1.5 py-0.5 text-[9px] font-bold bg-indigo-900/80 text-indigo-300 border border-indigo-700/50 rounded-full">2 Colors</span>
+        </div>
+        <p class="text-[10px] text-gray-400">Auto-matched to loaded slots. Override any slot mapping below:</p>
+        <div id="modalMultiColorRows" class="space-y-2 max-h-48 overflow-y-auto pr-1">
+          <!-- Populated dynamically with mapping rows -->
+        </div>
       </div>
 
       <!-- Auto Bed Leveling Toggle -->
@@ -502,6 +517,57 @@
       const tokenParam = token ? `&token=${encodeURIComponent(token)}` : '';
       const extra = extraParam ? `&${extraParam}` : '';
       return `${SLICER_SERVICE_URL}/thumbnail?file=${encodeURIComponent(filename)}${extra}${tokenParam}`;
+    }
+
+    const COLOR_PALETTE_MAP = {
+      "Black": [0, 0, 0],
+      "White": [255, 255, 255],
+      "Grey": [128, 128, 128],
+      "Silver": [192, 192, 192],
+      "Red": [220, 20, 60],
+      "Coral / Pink": [249, 93, 119],
+      "Orange": [255, 140, 0],
+      "Yellow": [255, 242, 66],
+      "Green": [34, 139, 34],
+      "Lime": [50, 205, 50],
+      "Blue": [30, 144, 255],
+      "Navy": [0, 0, 128],
+      "Purple": [128, 0, 128],
+      "Cyan": [0, 206, 209],
+      "Brown": [139, 69, 19]
+    };
+
+    function approxColorName(hexCode) {
+      if (!hexCode || !hexCode.startsWith('#') || hexCode.length < 7) return "";
+      try {
+        const h = hexCode.replace('#', '');
+        const r = parseInt(h.substring(0, 2), 16);
+        const g = parseInt(h.substring(2, 4), 16);
+        const b = parseInt(h.substring(4, 6), 16);
+        let bestName = "Color";
+        let minDist = Infinity;
+        for (const [name, [cr, cg, cb]] of Object.entries(COLOR_PALETTE_MAP)) {
+          const dist = (r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2;
+          if (dist < minDist) {
+            minDist = dist;
+            bestName = name;
+          }
+        }
+        return bestName;
+      } catch (e) {
+        return "Color";
+      }
+    }
+
+    function onMultiColorSlotChange(sel) {
+      const parentRow = sel.closest('.mc-mapping-row');
+      if (!parentRow) return;
+      const previewDot = parentRow.querySelector('.mc-slot-dot');
+      const opt = sel.options[sel.selectedIndex];
+      if (previewDot && opt) {
+        previewDot.style.backgroundColor = opt.dataset.color || "#808080";
+        previewDot.title = `${opt.value}: ${opt.dataset.filament} (${opt.dataset.colorName || opt.dataset.color})`;
+      }
     }
 
     // ───── Camera Handlers ─────
@@ -673,7 +739,10 @@
                   slot: chosenSlot,
                   plate: document.getElementById('plateSelect').value,
                   slice_time_seconds: isGcode ? 0 : (pl.slice_time || pl.slice_time_seconds || 0),
-                  estimated_seconds: pl.estimated_seconds || 5400
+                  estimated_seconds: pl.estimated_seconds || 5400,
+                  is_multi_color: pl.is_multi_color || false,
+                  filaments_required: pl.filaments_required || [],
+                  slot_map: pl.slot_map || []
                 })
               });
             }
@@ -689,7 +758,10 @@
                 slot: chosenSlot,
                 plate: document.getElementById('plateSelect').value,
                 slice_time_seconds: isGcode ? 0 : (result.slice_time || result.slice_time_seconds || 0),
-                estimated_seconds: result.estimated_seconds || 5400
+                estimated_seconds: result.estimated_seconds || 5400,
+                is_multi_color: result.is_multi_color || false,
+                filaments_required: result.filaments_required || [],
+                slot_map: result.slot_map || []
               })
             });
           }
@@ -767,21 +839,39 @@
 
         let html = '';
         items.forEach((item, idx) => {
-          const reqFil = item.filament || "PLA";
-          const filStatus = item.filament_status || {};
-          const isMatch = filStatus.match;
-          const assignedSlot = item.slot || filStatus.slot;
-          const slotDetail = (cachedAmsDetails && assignedSlot && cachedAmsDetails[assignedSlot]) || {};
-          const itemColor = item.slot_color || slotDetail.color || null;
-          const colorName = item.slot_color_name || slotDetail.color_name || "";
-          const colorDot = itemColor
-            ? `<span class="inline-block w-2.5 h-2.5 rounded-full border border-white/20 mr-1.5 shrink-0 shadow-sm" style="background-color: ${itemColor};" title="${colorName || itemColor}"></span>`
-            : '';
-          const colorLabel = colorName ? ` · ${colorName}` : "";
+          const isMultiColor = !!(item.is_multi_color || (item.filaments_required && item.filaments_required.length > 1));
+          let slotTag = '';
+          if (isMultiColor) {
+            const reqs = item.filaments_required || [];
+            const slotMap = item.slot_map || [];
+            const colorDots = reqs.map((r, rIdx) => {
+              const c = r.color || "#808080";
+              const cName = r.color_name || approxColorName(c);
+              const sm = slotMap.find(s => s.t === (r.tool !== undefined ? r.tool : rIdx));
+              const assigned = sm ? sm.slot : null;
+              const title = assigned ? `Tool ${rIdx+1} -> ${assigned} (${cName})` : `Tool ${rIdx+1}: ${cName}`;
+              return `<span class="inline-block w-2.5 h-2.5 rounded-full border border-white/20 mr-1 shadow-sm shrink-0" style="background-color: ${c};" title="${title}"></span>`;
+            }).join('');
+            const assignedSummary = slotMap.map(s => s.slot).filter(Boolean).join(' • ');
+            const summaryLabel = assignedSummary ? ` · ${assignedSummary}` : ` · ${reqs.length} Colors`;
+            slotTag = `<span class="px-2 py-0.5 rounded text-[10px] font-bold bg-indigo-950/70 text-indigo-300 border border-indigo-700/50 inline-flex items-center">${colorDots}Multi-Color${summaryLabel}</span>`;
+          } else {
+            const reqFil = item.filament || "PLA";
+            const filStatus = item.filament_status || {};
+            const isMatch = filStatus.match;
+            const assignedSlot = item.slot || filStatus.slot;
+            const slotDetail = (cachedAmsDetails && assignedSlot && cachedAmsDetails[assignedSlot]) || {};
+            const itemColor = item.slot_color || slotDetail.color || null;
+            const colorName = item.slot_color_name || slotDetail.color_name || "";
+            const colorDot = itemColor
+              ? `<span class="inline-block w-2.5 h-2.5 rounded-full border border-white/20 mr-1.5 shrink-0 shadow-sm" style="background-color: ${itemColor};" title="${colorName || itemColor}"></span>`
+              : '';
+            const colorLabel = colorName ? ` · ${colorName}` : "";
 
-          const slotTag = isMatch 
-            ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold badge-matched inline-flex items-center">${colorDot}${assignedSlot || 'A1'}: ${reqFil}${colorLabel}</span>`
-            : `<span class="px-2 py-0.5 rounded text-[10px] font-bold badge-mismatch inline-flex items-center"><i class="fa-solid fa-triangle-exclamation mr-1"></i>${reqFil} (Missing)</span>`;
+            slotTag = isMatch 
+              ? `<span class="px-2 py-0.5 rounded text-[10px] font-bold badge-matched inline-flex items-center">${colorDot}${assignedSlot || 'A1'}: ${reqFil}${colorLabel}</span>`
+              : `<span class="px-2 py-0.5 rounded text-[10px] font-bold badge-mismatch inline-flex items-center"><i class="fa-solid fa-triangle-exclamation mr-1"></i>${reqFil} (Missing)</span>`;
+          }
 
           const plateBadge = item.plate === 'B'
             ? `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900/60 text-blue-300 border border-blue-700/40">Plate B (Smooth)</span>`
@@ -900,45 +990,124 @@
       document.getElementById('modalFilename').innerText = job.display_name || job.filename;
       document.getElementById('modalEstTime').innerText = job.estimated_formatted || formatDuration(job.estimated_seconds);
 
-      // Populate Filament Select based on AMS
-      const filSelect = document.getElementById('modalFilamentSelect');
-      filSelect.innerHTML = '';
+      const isMultiColor = !!(job.is_multi_color || (job.filaments_required && job.filaments_required.length > 1));
+      const singleSection = document.getElementById('modalSingleColorSection');
+      const multiSection = document.getElementById('modalMultiColorSection');
 
-      let matchedIndex = 0;
-      let idx = 0;
-      const targetFil = (job.filament || "PLA").toUpperCase();
+      if (isMultiColor) {
+        if (singleSection) singleSection.classList.add('hidden');
+        if (multiSection) multiSection.classList.remove('hidden');
 
-      ['A1', 'A2', 'A3', 'A4'].forEach(slot => {
-        const detail = (cachedAmsDetails && cachedAmsDetails[slot]) || {};
-        const loaded = detail.name || cachedAmsSlots[slot] || "Empty";
-        const colorName = detail.color_name ? ` (${detail.color_name})` : '';
-        const activeStr = detail.is_active ? ' ★ In Nozzle' : '';
+        const reqs = job.filaments_required || [];
+        const slotMap = job.slot_map || [];
+        const badge = document.getElementById('modalMultiColorCountBadge');
+        if (badge) badge.innerText = `${reqs.length} Colors`;
 
-        const opt = document.createElement('option');
-        opt.value = slot;
-        opt.dataset.slot = slot;
-        opt.dataset.trayId = idx.toString();
-        opt.dataset.canvasId = "0";
-        opt.dataset.filament = loaded;
-        opt.dataset.color = detail.color || "#808080";
-        opt.dataset.colorName = detail.color_name || "";
-        opt.dataset.isActive = detail.is_active ? "1" : "0";
-        opt.dataset.brand = detail.brand || "ELEGOO";
-        opt.dataset.tempRange = detail.temp_range || "190-230°C";
-        opt.innerText = `${slot}: ${loaded}${colorName}${activeStr}`;
-        if (job.slot === slot) {
-          matchedIndex = idx;
-        } else if (!job.slot && (loaded.toUpperCase().includes(targetFil) || targetFil.includes(loaded.toUpperCase()))) {
-          matchedIndex = idx;
+        const rowsContainer = document.getElementById('modalMultiColorRows');
+        if (rowsContainer) {
+          rowsContainer.innerHTML = '';
+          reqs.forEach((req, idx) => {
+            const toolNum = (req.tool !== undefined ? req.tool : idx);
+            const toolLabel = `Tool ${toolNum + 1}`;
+            const reqColor = req.color || "#FFFFFF";
+            const reqColorName = req.color_name || approxColorName(reqColor);
+            const reqType = req.type || "PLA";
+
+            // Find matching slot mapping
+            const mappedEntry = slotMap.find(sm => sm.t === toolNum);
+            const preselectedSlot = mappedEntry ? mappedEntry.slot : null;
+
+            let optionsHtml = '';
+            let currentSelectedColor = "#808080";
+            let currentSelectedName = "";
+
+            ['A1', 'A2', 'A3', 'A4'].forEach((slot, slotIdx) => {
+              const detail = (cachedAmsDetails && cachedAmsDetails[slot]) || {};
+              const loaded = detail.name || cachedAmsSlots[slot] || "Empty";
+              const colorName = detail.color_name ? ` (${detail.color_name})` : '';
+              const activeStr = detail.is_active ? ' ★ In Nozzle' : '';
+              const color = detail.color || "#808080";
+
+              const isSelected = preselectedSlot ? (preselectedSlot === slot) : (slotIdx === idx % 4);
+              if (isSelected) {
+                currentSelectedColor = color;
+                currentSelectedName = loaded;
+              }
+
+              optionsHtml += `<option value="${slot}" data-slot="${slot}" data-tray-id="${slotIdx}" data-filament="${loaded}" data-color="${color}" data-color-name="${detail.color_name || ''}" ${isSelected ? 'selected' : ''}>
+                ${slot}: ${loaded}${colorName}${activeStr}
+              </option>`;
+            });
+
+            const row = document.createElement('div');
+            row.className = 'mc-mapping-row p-2 rounded-xl bg-gray-900/80 border border-gray-700/60 space-y-1.5';
+            row.innerHTML = `
+              <div class="flex items-center justify-between text-xs">
+                <div class="flex items-center space-x-1.5">
+                  <span class="w-3.5 h-3.5 rounded-full border border-white/30 shrink-0 shadow-inner" style="background-color: ${reqColor};"></span>
+                  <span class="font-bold text-white">${toolLabel} (${reqColorName})</span>
+                  <span class="text-[10px] text-gray-400 font-mono">${reqType}</span>
+                </div>
+                <span class="text-[10px] text-orange-400 font-semibold flex items-center">
+                  <i class="fa-solid fa-arrow-right text-[9px] mr-1 text-gray-500"></i> AMS Slot
+                </span>
+              </div>
+              <div class="flex items-center space-x-2">
+                <select data-tool-idx="${toolNum}" data-req-color="${reqColor}" data-req-type="${reqType}" onchange="onMultiColorSlotChange(this)" class="multi-color-slot-select flex-1 bg-gray-800 border border-gray-700 rounded-lg px-2.5 py-1.5 text-white text-xs focus:outline-none focus:border-orange-500">
+                  ${optionsHtml}
+                </select>
+                <span class="mc-slot-dot w-4 h-4 rounded-full border border-white/20 shrink-0 shadow-sm transition-all" style="background-color: ${currentSelectedColor};" title="${currentSelectedName}"></span>
+              </div>
+            `;
+            rowsContainer.appendChild(row);
+          });
         }
-        filSelect.appendChild(opt);
-        idx++;
-      });
+      } else {
+        if (singleSection) singleSection.classList.remove('hidden');
+        if (multiSection) multiSection.classList.add('hidden');
 
-      filSelect.selectedIndex = matchedIndex;
+        // Populate Single Filament Select based on AMS
+        const filSelect = document.getElementById('modalFilamentSelect');
+        filSelect.innerHTML = '';
+
+        let matchedIndex = 0;
+        let idx = 0;
+        const targetFil = (job.filament || "PLA").toUpperCase();
+
+        ['A1', 'A2', 'A3', 'A4'].forEach(slot => {
+          const detail = (cachedAmsDetails && cachedAmsDetails[slot]) || {};
+          const loaded = detail.name || cachedAmsSlots[slot] || "Empty";
+          const colorName = detail.color_name ? ` (${detail.color_name})` : '';
+          const activeStr = detail.is_active ? ' ★ In Nozzle' : '';
+
+          const opt = document.createElement('option');
+          opt.value = slot;
+          opt.dataset.slot = slot;
+          opt.dataset.trayId = idx.toString();
+          opt.dataset.canvasId = "0";
+          opt.dataset.filament = loaded;
+          opt.dataset.color = detail.color || "#808080";
+          opt.dataset.colorName = detail.color_name || "";
+          opt.dataset.isActive = detail.is_active ? "1" : "0";
+          opt.dataset.brand = detail.brand || "ELEGOO";
+          opt.dataset.tempRange = detail.temp_range || "190-230°C";
+          opt.innerText = `${slot}: ${loaded}${colorName}${activeStr}`;
+          if (job.slot === slot) {
+            matchedIndex = idx;
+          } else if (!job.slot && (loaded.toUpperCase().includes(targetFil) || targetFil.includes(loaded.toUpperCase()))) {
+            matchedIndex = idx;
+          }
+          filSelect.appendChild(opt);
+          idx++;
+        });
+
+        filSelect.selectedIndex = matchedIndex;
+        onModalFilamentChange();
+      }
 
       // Select recommended Plate
       const plateSelect = document.getElementById('modalPlateSelect');
+      const targetFil = (job.filament || "PLA").toUpperCase();
       if (job.plate) {
         plateSelect.value = job.plate;
       } else if (targetFil.includes("PRO") || targetFil.includes("ABS") || targetFil.includes("PETG")) {
@@ -960,7 +1129,6 @@
         autoToggle.checked = job.auto_level !== undefined ? !!job.auto_level : true;
       }
 
-      onModalFilamentChange();
       document.getElementById('printModal').classList.remove('hidden');
     }
 
@@ -977,6 +1145,7 @@
       const filSelect = document.getElementById('modalFilamentSelect');
       const plateSelect = document.getElementById('modalPlateSelect');
       const warning = document.getElementById('modalFilamentWarning');
+      if (!filSelect || filSelect.selectedIndex < 0) return;
       const selOpt = filSelect.options[filSelect.selectedIndex];
       const selFil = ((selOpt ? selOpt.dataset.filament : filSelect.value) || "").toUpperCase();
       const selPlate = plateSelect.value;
@@ -1021,33 +1190,71 @@
       btn.disabled = true;
       btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> Starting...';
 
-      const filSelect = document.getElementById('modalFilamentSelect');
       const plateSelect = document.getElementById('modalPlateSelect');
       const autoLevel = document.getElementById('modalAutoLevelToggle') ? document.getElementById('modalAutoLevelToggle').checked : true;
-      const selOpt = filSelect.options[filSelect.selectedIndex];
-      const selSlot = selOpt ? (selOpt.dataset.slot || selOpt.value) : "A1";
-      const selTrayId = selOpt ? parseInt(selOpt.dataset.trayId, 10) : 0;
-      const selFilament = selOpt ? (selOpt.dataset.filament || selOpt.innerText) : "PLA";
+
+      const isMultiColor = currentModalJob && (currentModalJob.is_multi_color || (currentModalJob.filaments_required && currentModalJob.filaments_required.length > 1));
+      let slotMap = null;
+      let selSlot = "A1";
+      let selTrayId = 0;
+      let selFilament = "PLA";
+
+      if (isMultiColor) {
+        slotMap = [];
+        const selects = document.querySelectorAll('.multi-color-slot-select');
+        selects.forEach(sel => {
+          const t = parseInt(sel.dataset.toolIdx, 10);
+          const selOpt = sel.options[sel.selectedIndex];
+          slotMap.push({
+            t: isNaN(t) ? 0 : t,
+            canvas_id: 0,
+            tray_id: parseInt(selOpt.dataset.trayId, 10),
+            slot: selOpt.value,
+            slot_name: selOpt.value,
+            slot_color: selOpt.dataset.color,
+            slot_filament: selOpt.dataset.filament,
+            req_color: sel.dataset.reqColor,
+            req_type: sel.dataset.reqType,
+          });
+        });
+        if (slotMap.length > 0) {
+          selSlot = slotMap[0].slot;
+          selTrayId = slotMap[0].tray_id;
+          selFilament = slotMap[0].slot_filament;
+        }
+      } else {
+        const filSelect = document.getElementById('modalFilamentSelect');
+        const selOpt = filSelect.options[filSelect.selectedIndex];
+        selSlot = selOpt ? (selOpt.dataset.slot || selOpt.value) : "A1";
+        selTrayId = selOpt ? parseInt(selOpt.dataset.trayId, 10) : 0;
+        selFilament = selOpt ? (selOpt.dataset.filament || selOpt.innerText) : "PLA";
+      }
 
       try {
+        const payload = {
+          queue_id: currentModalJob.id,
+          filename: currentModalJob.filename,
+          plate_type: plateSelect.value,
+          plate: plateSelect.value,
+          slot: selSlot,
+          tray_id: isNaN(selTrayId) ? 0 : selTrayId,
+          canvas_id: 0,
+          filament: selFilament,
+          auto_level: autoLevel
+        };
+        if (slotMap && slotMap.length > 0) {
+          payload.slot_map = slotMap;
+          payload.is_multi_color = true;
+        }
+
         const res = await authFetch(`${SLICER_SERVICE_URL}/print/confirm_start`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            queue_id: currentModalJob.id,
-            filename: currentModalJob.filename,
-            plate_type: plateSelect.value,
-            plate: plateSelect.value,
-            slot: selSlot,
-            tray_id: isNaN(selTrayId) ? 0 : selTrayId,
-            canvas_id: 0,
-            filament: selFilament,
-            auto_level: autoLevel
-          })
+          body: JSON.stringify(payload)
         });
 
         const data = await res.json();
-        if (res.ok && data.status === "ok") {
+        if (res.ok && (data.status === "ok" || data.status === "success")) {
           closePrintModal();
           refreshQueue();
           refreshHistory();
