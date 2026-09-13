@@ -76,7 +76,8 @@ def patch_pycentauri_cc2() -> None:
         ):
             self._require_control("start_print")
             if slot_map is None and tray_id is not None:
-                slot_map = [{"t": 0, "canvas_id": int(canvas_id), "tray_id": int(tray_id)}]
+                # Map tools 0..3 to the chosen tray so any tool reference (T0, T1, etc.) uses this slot
+                slot_map = [{"t": i, "canvas_id": int(canvas_id), "tray_id": int(tray_id)} for i in range(4)]
 
             config: dict[str, Any] = {
                 "delay_video": bool(timelapse),
