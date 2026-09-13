@@ -1498,6 +1498,12 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
     def _normalize_path(self) -> str:
         p = urlparse(self.path).path
         if p.startswith("/api/cc2_slicer"):
