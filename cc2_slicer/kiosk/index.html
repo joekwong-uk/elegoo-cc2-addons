@@ -61,9 +61,15 @@
         <p class="text-xs text-gray-400">Mobile Slicing & Direct Queue</p>
       </div>
     </div>
-    <div id="serviceBadge" class="flex items-center space-x-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-950/60 text-emerald-400 border border-emerald-800/40">
-      <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-      <span id="serviceText">Ready</span>
+    <div class="flex items-center space-x-2">
+      <a href="/local/cc2_kiosk/Send_to_CC2.shortcut" download title="Install iOS Share Sheet Shortcut" class="flex items-center space-x-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 transition">
+        <i class="fa-brands fa-apple text-xs"></i>
+        <span>iOS Share</span>
+      </a>
+      <div id="serviceBadge" class="flex items-center space-x-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-950/60 text-emerald-400 border border-emerald-800/40">
+        <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+        <span id="serviceText">Ready</span>
+      </div>
     </div>
   </header>
 
@@ -136,12 +142,12 @@
 
     <div id="dropzone" onclick="document.getElementById('fileInput').click()" 
          class="border-2 border-dashed border-gray-700 hover:border-orange-500/70 rounded-xl p-6 text-center cursor-pointer transition-all duration-200 bg-gray-900/40">
-      <input type="file" id="fileInput" accept=".3mf,.stl,.gcode" class="hidden" onchange="handleFileSelected(this)">
+      <input type="file" id="fileInput" accept=".3mf,.stl,.smf,.gcode" class="hidden" onchange="handleFileSelected(this)">
       <div id="dropzonePrompt" class="space-y-2 pointer-events-none">
         <div class="w-12 h-12 mx-auto rounded-full bg-orange-500/10 text-orange-400 flex items-center justify-center text-xl">
           <i class="fa-solid fa-file-arrow-up"></i>
         </div>
-        <p class="text-xs font-semibold text-gray-200">Drag & drop 3MF, STL, or GCODE here</p>
+        <p class="text-xs font-semibold text-gray-200">Drag & drop 3MF, STL, SMF, or GCODE here</p>
         <p class="text-[11px] text-gray-400">or tap to browse • Direct G-code upload or fast N100 slicing</p>
       </div>
       <div id="fileDetails" class="hidden flex items-center space-x-3 text-left">
