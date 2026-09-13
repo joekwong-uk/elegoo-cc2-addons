@@ -2,6 +2,9 @@
 <html lang="en" class="dark">
 <head>
   <meta charset="UTF-8">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
   <meta name="referrer" content="no-referrer-when-downgrade">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>CC2 Mobile Print Kiosk</title>
@@ -412,7 +415,12 @@
     const SLICER_SERVICE_URL = "/api/cc2_slicer";
     let selectedFile = null;
     let cachedAmsSlots = { "A1": "PLA", "A2": "PLA", "A3": "PLA PRO", "A4": "RAPID PLA+" };
-    let cachedAmsDetails = {};
+    let cachedAmsDetails = {
+      "A1": { "slot": "A1", "tray_id": 0, "name": "PLA", "color": "#FFF242", "color_name": "Yellow", "brand": "ELEGOO", "is_active": false, "is_loaded": true },
+      "A2": { "slot": "A2", "tray_id": 1, "name": "PLA", "color": "#F95D77", "color_name": "Coral / Pink", "brand": "ELEGOO", "is_active": true, "is_loaded": true },
+      "A3": { "slot": "A3", "tray_id": 2, "name": "PLA PRO", "color": "#898989", "color_name": "Grey", "brand": "ELEGOO", "is_active": false, "is_loaded": true },
+      "A4": { "slot": "A4", "tray_id": 3, "name": "RAPID PLA+", "color": "#000000", "color_name": "Black", "brand": "ELEGOO", "is_active": false, "is_loaded": true }
+    };
     let currentModalJob = null;
 
     // ───── Formatting Helpers ─────
@@ -1180,15 +1188,38 @@
       }
     }
 
+    // ───── Slots & Color Details ─────
+    async function fetchSlots() {
+      try {
+        const res = await authFetch(`${SLICER_SERVICE_URL}/slots`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (data.slots && Object.keys(data.slots).length > 0) {
+          cachedAmsDetails = data.slots;
+          const newSlots = {};
+          Object.keys(data.slots).forEach(k => {
+            newSlots[k] = data.slots[k].name;
+          });
+          cachedAmsSlots = newSlots;
+          renderAMS(cachedAmsSlots, cachedAmsDetails);
+          updateUploadFilamentSelect(cachedAmsDetails);
+        }
+      } catch (e) {
+        console.warn("Slots fetch error:", e);
+      }
+    }
+
     // ───── Init & Periodic Polling ─────
     reconnectCamera();
     checkService();
     refreshPrintStatus();
+    fetchSlots();
     refreshQueue();
     refreshHistory();
 
     setInterval(checkService, 15000);
     setInterval(refreshPrintStatus, 3000);
+    setInterval(fetchSlots, 8000);
     setInterval(refreshQueue, 5000);
     setInterval(refreshHistory, 10000);
   </script>
