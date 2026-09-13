@@ -14,8 +14,10 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -179,6 +181,9 @@ def extract_thumbnail(mf_path: Path, plate_idx: int = 1) -> bytes | None:
                 f"Metadata/plate_{plate_idx + 1}.png",
                 "Metadata/plate_1.png",
                 "Metadata/top_1.png",
+                "Auxiliaries/.thumbnails/thumbnail_middle.png",
+                "Auxiliaries/.thumbnails/thumbnail_3mf.png",
+                "Auxiliaries/.thumbnails/thumbnail_small.png",
             ]
             for cand in candidates:
                 if cand in z.namelist():
@@ -188,8 +193,51 @@ def extract_thumbnail(mf_path: Path, plate_idx: int = 1) -> bytes | None:
                     buf = io.BytesIO()
                     img.save(buf, format="PNG")
                     return buf.getvalue()
+            # Try any picture in Auxiliaries/Model Pictures/
+            for name in z.namelist():
+                if name.startswith("Auxiliaries/Model Pictures/") and name.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+                    data = z.read(name)
+                    img = Image.open(io.BytesIO(data))
+                    img.thumbnail((300, 300), Image.Resampling.LANCZOS)
+                    buf = io.BytesIO()
+                    img.save(buf, format="PNG")
+                    return buf.getvalue()
     except Exception as e:
         print(f"[!] Thumbnail extraction error: {e}", flush=True)
+    return None
+
+
+def extract_3mf_title(archive_path: Path) -> str | None:
+    """Extract model title from 3MF project metadata or auxiliaries."""
+    try:
+        with zipfile.ZipFile(archive_path, "r") as z:
+            # 1. Inspect Metadata/model_settings.config (Bambu / OrcaSlicer project)
+            if "Metadata/model_settings.config" in z.namelist():
+                xml_data = z.read("Metadata/model_settings.config")
+                root = ET.fromstring(xml_data)
+                for obj in root.findall(".//object"):
+                    for meta in obj.findall("metadata"):
+                        if meta.get("key") == "name" and meta.get("value"):
+                            val = meta.get("value").strip()
+                            val = re.sub(r"\.(stl|3mf|smf|gcode)$", "", val, flags=re.IGNORECASE).strip()
+                            if val and not val.lower().startswith("plate_") and val.lower() not in ("default", "model"):
+                                return val
+                for part in root.findall(".//part"):
+                    for meta in part.findall("metadata"):
+                        if meta.get("key") == "name" and meta.get("value"):
+                            val = meta.get("value").strip()
+                            val = re.sub(r"\.(stl|3mf|smf|gcode)$", "", val, flags=re.IGNORECASE).strip()
+                            if val and not val.lower().startswith("plate_") and val.lower() not in ("default", "model"):
+                                return val
+            # 2. Inspect Auxiliaries/Model Pictures/*.webp
+            for name in z.namelist():
+                if name.startswith("Auxiliaries/Model Pictures/") and not name.endswith("/"):
+                    cand = name.split("/")[-1]
+                    cand = re.sub(r"\.(webp|png|jpg|jpeg)$", "", cand, flags=re.IGNORECASE).strip()
+                    if cand and not cand.isdigit() and len(cand) > 2:
+                        return cand
+    except Exception as e:
+        print(f"[!] Warning extracting 3MF title: {e}", flush=True)
     return None
 
 
@@ -432,7 +480,7 @@ def slice_and_upload(input_path: Path) -> dict:
                     except Exception:
                         pass
 
-    # Upload to CC2 printer via pycentauri CLI
+    # Upload to CC2 printer via pycentauri CLI (non-fatal if printer is printing/busy)
     up_cmd = [
         "centauri", "upload", str(final_gcode),
         "--host", PRINTER_IP,
@@ -441,9 +489,9 @@ def slice_and_upload(input_path: Path) -> dict:
     ]
     print(f"[*] Uploading to CC2 at {PRINTER_IP}...", flush=True)
     up_proc = subprocess.run(up_cmd, capture_output=True, text=True, timeout=120)
-
-    if up_proc.returncode != 0:
-        raise RuntimeError(f"centauri upload failed: {up_proc.stderr}")
+    upload_ok = (up_proc.returncode == 0)
+    if not upload_ok:
+        print(f"[!] Note: CC2 file upload postponed (printer is busy/printing): {up_proc.stderr}", flush=True)
 
     result = {
         "status": "success",
@@ -454,7 +502,7 @@ def slice_and_upload(input_path: Path) -> dict:
         "estimated_seconds": est_seconds,
         "estimated_formatted": format_duration(est_seconds),
         "size_bytes": final_gcode.stat().st_size,
-        "uploaded": True,
+        "uploaded": upload_ok,
         "printer_ip": PRINTER_IP,
     }
     if thumb_png:
@@ -806,6 +854,23 @@ def execute_cc2_start_print(
         tray_id, canvas_id = resolve_tray_and_canvas(slot=slot, filament=filament)
 
     print(f"[CC2] execute_cc2_start_print: filename={filename}, plate={plate}, slot={slot}, tray_id={tray_id}, canvas_id={canvas_id}, auto_leveling={auto_leveling}, timelapse={timelapse}", flush=True)
+
+    # Ensure file is uploaded to CC2 printer storage if present in local cc2_output
+    local_path = OUTPUT_DIR / filename
+    if local_path.exists():
+        up_cmd = [
+            "centauri", "upload", str(local_path),
+            "--host", PRINTER_IP,
+            "--access-code", ACCESS_CODE,
+            "--enable-control",
+        ]
+        try:
+            print(f"[*] Ensuring {filename} is uploaded to CC2 before start...", flush=True)
+            up_proc = subprocess.run(up_cmd, capture_output=True, text=True, timeout=120)
+            if up_proc.returncode != 0:
+                print(f"[!] Warning uploading before print: {up_proc.stderr}", flush=True)
+        except Exception as _ue:
+            print(f"[!] Upload before print exception: {_ue}", flush=True)
 
     import asyncio
     from pycentauri.cc2 import CC2Printer
@@ -1246,13 +1311,6 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 # Raw binary upload
                 file_data = body
 
-            if not filename:
-                filename = "model.stl"
-
-            filename = Path(filename).name.strip()
-            if not filename:
-                filename = "model.stl"
-
             if not file_data:
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json")
@@ -1260,53 +1318,215 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"error": "No file uploaded or file is empty"}).encode())
                 return
 
+            # Format detection via magic bytes
+            is_3mf = file_data.startswith(b"PK\x03\x04")
+            is_gcode = (
+                file_data.startswith(b";")
+                or b"\nM104" in file_data[:2000]
+                or b"\nG1 " in file_data[:2000]
+                or b"\nG0 " in file_data[:2000]
+                or b"; generated by" in file_data[:2000]
+                or b"; G-Code generated" in file_data[:2000]
+            )
+            is_stl = not is_3mf and not is_gcode
+
             upload_dir = Path("/tmp/uploads")
             upload_dir.mkdir(parents=True, exist_ok=True)
+
+            # Determine clean filename and display_name
+            raw_fn = Path(filename).name.strip() if filename else ""
+            is_generic = not raw_fn or raw_fn.lower() in (
+                "model.stl", "model.3mf", "model.gcode", "model",
+                "shortcut input.stl", "shortcut input.3mf", "shortcut input",
+                "file.stl", "file.3mf", "file", "upload.stl", "upload.3mf"
+            )
+
+            display_name = raw_fn
+
+            if is_3mf:
+                temp_inspect = upload_dir / f"tmp_inspect_{int(time.time()*1000)}.3mf"
+                temp_inspect.write_bytes(file_data)
+                extracted_title = extract_3mf_title(temp_inspect)
+                temp_inspect.unlink(missing_ok=True)
+
+                if is_generic and extracted_title:
+                    filename = f"{extracted_title}.3mf"
+                    display_name = extracted_title
+                elif is_generic:
+                    filename = f"model_{int(time.time())}.3mf"
+                    display_name = "3D Model"
+                else:
+                    clean_stem = re.sub(r"\.(stl|3mf|smf|gcode)$", "", raw_fn, flags=re.IGNORECASE).strip()
+                    filename = f"{clean_stem}.3mf"
+                    display_name = clean_stem
+
+            elif is_gcode:
+                if is_generic:
+                    m_gc = re.search(rb';\s*(?:model|filename|title|source)\s*:\s*([^\r\n]+)', file_data[:4096], re.IGNORECASE)
+                    if m_gc:
+                        g_title = m_gc.group(1).decode("utf-8", errors="ignore").strip()
+                        g_title = re.sub(r"\.(stl|3mf|smf|gcode)$", "", g_title, flags=re.IGNORECASE).strip()
+                        filename = f"{g_title}.gcode" if g_title else f"model_{int(time.time())}.gcode"
+                        display_name = g_title or "G-code Job"
+                    else:
+                        filename = f"model_{int(time.time())}.gcode"
+                        display_name = "G-code Job"
+                else:
+                    clean_stem = re.sub(r"\.(stl|3mf|smf|gcode)$", "", raw_fn, flags=re.IGNORECASE).strip()
+                    filename = f"{clean_stem}.gcode"
+                    display_name = clean_stem
+
+            else:
+                # STL
+                if is_generic:
+                    if file_data.startswith(b"solid "):
+                        hdr_name = file_data[:80].decode("utf-8", errors="ignore").split("\n")[0][6:].strip()
+                        if hdr_name and hdr_name.lower() not in ("default", "model", "ascii", "solid", "openscad_model"):
+                            filename = f"{hdr_name}.stl"
+                            display_name = hdr_name
+                        else:
+                            filename = f"model_{int(time.time())}.stl"
+                            display_name = "3D Model"
+                    else:
+                        filename = f"model_{int(time.time())}.stl"
+                        display_name = "3D Model"
+                else:
+                    clean_stem = re.sub(r"\.(stl|3mf|smf|gcode)$", "", raw_fn, flags=re.IGNORECASE).strip()
+                    filename = f"{clean_stem}.stl"
+                    display_name = clean_stem
+
             saved_path = upload_dir / filename
             with open(saved_path, "wb") as f:
                 f.write(file_data)
 
-            try:
-                # Support .smf: copy/rename to .3mf
-                if saved_path.suffix.lower() == ".smf":
-                    target_3mf = saved_path.with_suffix(".3mf")
-                    shutil.copy2(saved_path, target_3mf)
-                    saved_path = target_3mf
-
-                if saved_path.suffix.lower() == ".gcode":
+            # If G-code: process immediately (fast, ~0.2s)
+            if saved_path.suffix.lower() == ".gcode":
+                try:
                     res = process_gcode_upload(saved_path)
-                else:
-                    res = slice_and_upload(saved_path)
+                    if auto_queue:
+                        gcode_fname = res.get("gcode") or res.get("filename") or filename
+                        est_sec = res.get("estimated_seconds") or 3600
+                        job = add_job_to_queue(
+                            filename=gcode_fname,
+                            est_seconds=est_sec,
+                            filament=param_filament or "PLA",
+                            plate=param_plate or "A",
+                            slot=param_slot or None,
+                            auto_level=auto_level,
+                            slice_time_seconds=res.get("slice_time") or res.get("slice_time_seconds"),
+                            display_name=display_name,
+                            filesize=f"{round(len(file_data) / (1024*1024), 2)} MB",
+                        )
+                        res["queued"] = True
+                        res["job"] = job
+                        res["message"] = f"File {display_name} processed and added to print queue successfully!"
 
-                # Auto-Queue if requested
-                if auto_queue:
-                    gcode_fname = res.get("gcode") or res.get("filename") or filename
-                    est_sec = res.get("estimated_seconds") or 3600
-                    job = add_job_to_queue(
-                        filename=gcode_fname,
-                        est_seconds=est_sec,
-                        filament=param_filament or "PLA",
-                        plate=param_plate or "A",
-                        slot=param_slot or None,
-                        auto_level=auto_level,
-                        slice_time_seconds=res.get("slice_time") or res.get("slice_time_seconds"),
-                        display_name=filename,
-                        filesize=f"{round(len(file_data) / (1024*1024), 2)} MB",
-                    )
-                    res["queued"] = True
-                    res["job"] = job
-                    res["message"] = f"File {filename} processed and added to print queue successfully!"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(res).encode())
+                    return
+                except Exception as e:
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": str(e)}).encode())
+                    return
+
+            # If 3MF or STL:
+            if auto_queue:
+                base_name = re.sub(r"\.(stl|3mf|smf)$", "", filename, flags=re.IGNORECASE)
+                # Pre-extract thumbnail if 3MF
+                if is_3mf:
+                    try:
+                        thumb_data = extract_thumbnail(saved_path)
+                        if thumb_data:
+                            save_cached_thumbnail(base_name, thumb_data)
+                    except Exception:
+                        pass
+
+                resolved_tray, _ = resolve_tray_and_canvas(slot=param_slot, filament=param_filament)
+                resolved_slot = param_slot or f"A{resolved_tray + 1}"
+
+                job_id = f"job_{int(time.time() * 1000)}"
+                initial_job = {
+                    "id": job_id,
+                    "filename": f"{base_name}.gcode",
+                    "display_name": display_name,
+                    "filament": param_filament or "PLA",
+                    "slot": resolved_slot,
+                    "tray_id": resolved_tray,
+                    "plate": param_plate or "A",
+                    "auto_level": auto_level,
+                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "slice_time_seconds": None,
+                    "estimated_seconds": parse_time_from_string_or_filename(filename) or 3600,
+                    "estimated_formatted": "Slicing on N100...",
+                    "filesize": f"{round(len(file_data) / (1024*1024), 2)} MB",
+                    "status": "slicing",
+                }
+                queue = load_queue()
+                queue.append(initial_job)
+                save_queue(queue)
+
+                def _bg_slice_task(fpath: Path, jid: str, bname: str):
+                    print(f"[*] Background slicing started for {fpath.name} ({jid})...", flush=True)
+                    try:
+                        s_res = slice_and_upload(fpath)
+                        print(f"[+] Background slicing succeeded for {fpath.name}: {s_res.get('gcode')}", flush=True)
+                        q = load_queue()
+                        for it in q:
+                            if it.get("id") == jid:
+                                it["filename"] = s_res.get("gcode") or f"{bname}.gcode"
+                                it["status"] = "queued"
+                                it["slice_time_seconds"] = s_res.get("slice_time")
+                                est = s_res.get("estimated_seconds") or parse_time_from_string_or_filename(fpath.name) or 3600
+                                it["estimated_seconds"] = est
+                                it["estimated_formatted"] = format_duration(est)
+                                break
+                        save_queue(q)
+                    except Exception as ex:
+                        print(f"[!] Background slicing failed for {fpath.name}: {ex}", flush=True)
+                        q = load_queue()
+                        for it in q:
+                            if it.get("id") == jid:
+                                it["status"] = "error"
+                                it["estimated_formatted"] = "Slicing failed"
+                                it["error"] = str(ex)
+                                break
+                        save_queue(q)
+
+                threading.Thread(
+                    target=_bg_slice_task,
+                    args=(saved_path, job_id, base_name),
+                    daemon=True,
+                ).start()
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps(res).encode())
-            except Exception as e:
-                self.send_response(500)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": str(e)}).encode())
-            return
+                self.wfile.write(json.dumps({
+                    "status": "success",
+                    "queued": True,
+                    "message": f"'{display_name}' received! Slicing in background on N100 and queued to CC2.",
+                    "job": initial_job,
+                    "filename": filename,
+                    "display_name": display_name,
+                }).encode())
+                return
+            else:
+                try:
+                    res = slice_and_upload(saved_path)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(res).encode())
+                except Exception as e:
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": str(e)}).encode())
+                return
 
         # 2. Queue Operations
         if clean in ("/api/queue", "/queue"):
@@ -1401,6 +1621,20 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                     self.send_header("Content-Type", "application/json")
                     self.end_headers()
                     self.wfile.write(json.dumps({"error": "No job found to start"}).encode())
+                    return
+
+                if target_job.get("status") == "slicing":
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Job is still slicing on N100. Please wait until slicing completes."}).encode())
+                    return
+
+                if target_job.get("status") == "error":
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": f"Job slicing failed: {target_job.get('error', 'unknown error')}"}).encode())
                     return
 
                 target_file = target_job.get("filename")
@@ -1505,6 +1739,18 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                         break
 
             if target_job:
+                if target_job.get("status") == "slicing":
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "Job is still slicing on N100. Please wait until slicing completes."}).encode())
+                    return
+                if target_job.get("status") == "error":
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": f"Job slicing failed: {target_job.get('error', 'unknown error')}"}).encode())
+                    return
                 filename = target_job.get("filename")
                 if "auto_level" in target_job and raw_auto_level is None:
                     job_al = target_job.get("auto_level")
