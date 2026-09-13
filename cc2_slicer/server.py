@@ -323,7 +323,7 @@ def sanitize_3mf_for_slicing(file_path: Path) -> Path:
       - prime_tower_lift_height: -1 -> 0
     which fail OrcaSlicer CLI schema validation [0, ...] with exit code 238 (-18).
     """
-    if file_path.suffix.lower() != ".3mf":
+    if file_path.suffix.lower() not in (".3mf", ".smf"):
         return file_path
 
     sanitized_path = file_path.with_name(f"clean_{file_path.name}")
@@ -361,7 +361,7 @@ def slice_and_upload(input_path: Path) -> dict:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     filename = input_path.name
-    base_name = re.sub(r"\.(stl|3mf)$", "", filename, flags=re.IGNORECASE)
+    base_name = re.sub(r"\.(stl|3mf|smf)$", "", filename, flags=re.IGNORECASE)
 
     # Sanitize 3MF to avoid OrcaSlicer CLI validation errors (code 238)
     slice_input = sanitize_3mf_for_slicing(input_path)
@@ -414,7 +414,7 @@ def slice_and_upload(input_path: Path) -> dict:
 
     # Extract thumbnail if 3MF
     thumb_png = None
-    if input_path.suffix.lower() == ".3mf":
+    if input_path.suffix.lower() in (".3mf", ".smf"):
         thumb_png = extract_thumbnail(input_path)
         if thumb_png:
             inject_gcode_thumbnails(final_gcode, thumb_png)
@@ -677,6 +677,64 @@ def fetch_thumbnail_from_printer(filename: str) -> bytes | None:
     except Exception as e:
         print(f"[!] Warning fetching thumbnail for {filename} from CC2: {e}", flush=True)
         return None
+
+
+def add_job_to_queue(
+    filename: str,
+    est_seconds: int | None = None,
+    filament: str = "PLA",
+    plate: str = "A",
+    slot: str | None = None,
+    tray_id: int | None = None,
+    slice_time_seconds: float | None = None,
+    display_name: str | None = None,
+    auto_level: bool = True,
+    filesize: str = "",
+) -> dict[str, Any]:
+    """Helper to construct, enrich, and append a print job to the persistent queue."""
+    queue = load_queue()
+    est = est_seconds
+    if not est or est in (180, 3600, 5400):
+        cand = OUTPUT_DIR / filename
+        if cand.exists():
+            gcode_est = parse_estimated_time_from_gcode(cand)
+            if gcode_est > 0:
+                est = gcode_est
+    if not est:
+        est = parse_time_from_string_or_filename(filename) or 3600
+
+    base_name = re.sub(r"\.(stl|3mf|smf|gcode)$", "", filename, flags=re.IGNORECASE)
+    thumb_path = Path(f"/config/www/cc2_kiosk/thumbnails/{base_name}.png")
+    if not thumb_path.exists():
+        tdata = fetch_thumbnail_from_printer(filename)
+        if tdata:
+            save_cached_thumbnail(base_name, tdata)
+
+    # Resolve slot & tray_id if not explicitly provided
+    if tray_id is None:
+        tray_id, _cid = resolve_tray_and_canvas(slot=slot, filament=filament)
+        if not slot:
+            slot = f"A{tray_id + 1}"
+
+    job = {
+        "id": f"job_{int(time.time() * 1000)}",
+        "filename": filename,
+        "display_name": display_name or filename,
+        "filament": filament,
+        "slot": slot,
+        "tray_id": tray_id,
+        "plate": plate,
+        "auto_level": auto_level,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "slice_time_seconds": slice_time_seconds,
+        "estimated_seconds": est,
+        "estimated_formatted": format_duration(est),
+        "filesize": filesize,
+        "status": "queued",
+    }
+    queue.append(job)
+    save_queue(queue)
+    return job
 
 
 def get_cc2_files_direct() -> list[dict[str, Any]]:
@@ -1123,39 +1181,83 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
 
         # 1. Slice and Upload
         if clean in ("/api/upload", "/upload", "/api/slice", "/slice"):
+            parsed_url = urlparse(self.path)
+            qparams = parse_qs(parsed_url.query)
+
+            raw_auto_queue = qparams.get("auto_queue", [""])[0] or self.headers.get("X-Auto-Queue", "")
+            auto_queue = raw_auto_queue.lower() in ("1", "true", "yes", "on")
+
+            param_filament = qparams.get("filament", [""])[0] or self.headers.get("X-Filament", "")
+            param_plate = qparams.get("plate", [""])[0] or self.headers.get("X-Plate", "")
+            param_slot = qparams.get("slot", [""])[0] or self.headers.get("X-Slot", "")
+            raw_auto_level = qparams.get("auto_level", [""])[0] or self.headers.get("X-Auto-Level", "")
+            auto_level = False if raw_auto_level.lower() in ("0", "false", "no") else True
+
+            filename = (
+                qparams.get("filename", [""])[0]
+                or self.headers.get("X-Filename", "")
+                or ""
+            )
+            cd = self.headers.get("Content-Disposition", "")
+            if not filename and cd:
+                m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd)
+                if m:
+                    filename = m.group(1).strip()
+
             content_type = self.headers.get("Content-Type", "")
             content_length = int(self.headers.get("Content-Length", 0))
-
-            if not content_type.startswith("multipart/form-data"):
-                self.send_response(400)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps({"error": "Expected multipart/form-data"}).encode())
-                return
-
-            boundary = content_type.split("boundary=")[1].strip().encode()
             body = self.rfile.read(content_length)
 
-            parts = body.split(b"--" + boundary)
             file_data = None
-            filename = "model.stl"
 
-            for part in parts:
-                if b"Content-Disposition:" in part and b"filename=" in part:
-                    header_end = part.find(b"\r\n\r\n")
-                    if header_end != -1:
-                        headers_raw = part[:header_end].decode("utf-8", errors="replace")
-                        m = re.search(r'filename="([^"]+)"', headers_raw)
-                        if m:
-                            filename = m.group(1)
-                        file_data = part[header_end + 4 :].rstrip(b"\r\n")
-                        break
+            if content_type.startswith("multipart/form-data"):
+                boundary_match = re.search(r'boundary=([^;]+)', content_type)
+                if boundary_match:
+                    boundary = boundary_match.group(1).strip().strip('"').encode()
+                    parts = body.split(b"--" + boundary)
+                    for part in parts:
+                        if b"Content-Disposition:" in part:
+                            header_end = part.find(b"\r\n\r\n")
+                            if header_end != -1:
+                                headers_raw = part[:header_end].decode("utf-8", errors="replace")
+                                part_body = part[header_end + 4 :].rstrip(b"\r\n")
+
+                                m_fn = re.search(r'filename="([^"]+)"', headers_raw)
+                                if m_fn:
+                                    if not filename or filename == "model.stl":
+                                        filename = m_fn.group(1)
+                                    file_data = part_body
+                                else:
+                                    m_name = re.search(r'name="([^"]+)"', headers_raw)
+                                    if m_name:
+                                        f_name = m_name.group(1)
+                                        f_val = part_body.decode("utf-8", errors="replace").strip()
+                                        if f_name == "auto_queue" and f_val.lower() in ("1", "true", "yes", "on"):
+                                            auto_queue = True
+                                        elif f_name == "filament" and f_val and not param_filament:
+                                            param_filament = f_val
+                                        elif f_name == "plate" and f_val and not param_plate:
+                                            param_plate = f_val
+                                        elif f_name == "slot" and f_val and not param_slot:
+                                            param_slot = f_val
+                                        elif f_name == "auto_level" and f_val.lower() in ("0", "false", "no"):
+                                            auto_level = False
+            else:
+                # Raw binary upload
+                file_data = body
+
+            if not filename:
+                filename = "model.stl"
+
+            filename = Path(filename).name.strip()
+            if not filename:
+                filename = "model.stl"
 
             if not file_data:
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"error": "No file uploaded"}).encode())
+                self.wfile.write(json.dumps({"error": "No file uploaded or file is empty"}).encode())
                 return
 
             upload_dir = Path("/tmp/uploads")
@@ -1165,10 +1267,36 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 f.write(file_data)
 
             try:
+                # Support .smf: copy/rename to .3mf
+                if saved_path.suffix.lower() == ".smf":
+                    target_3mf = saved_path.with_suffix(".3mf")
+                    shutil.copy2(saved_path, target_3mf)
+                    saved_path = target_3mf
+
                 if saved_path.suffix.lower() == ".gcode":
                     res = process_gcode_upload(saved_path)
                 else:
                     res = slice_and_upload(saved_path)
+
+                # Auto-Queue if requested
+                if auto_queue:
+                    gcode_fname = res.get("gcode") or res.get("filename") or filename
+                    est_sec = res.get("estimated_seconds") or 3600
+                    job = add_job_to_queue(
+                        filename=gcode_fname,
+                        est_seconds=est_sec,
+                        filament=param_filament or "PLA",
+                        plate=param_plate or "A",
+                        slot=param_slot or None,
+                        auto_level=auto_level,
+                        slice_time_seconds=res.get("slice_time") or res.get("slice_time_seconds"),
+                        display_name=filename,
+                        filesize=f"{round(len(file_data) / (1024*1024), 2)} MB",
+                    )
+                    res["queued"] = True
+                    res["job"] = job
+                    res["message"] = f"File {filename} processed and added to print queue successfully!"
+
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -1203,46 +1331,21 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 plate = data.get("plate", "A")
                 slot = data.get("slot")
                 tray_id = data.get("tray_id")
+                raw_auto_level = data.get("auto_level")
+                auto_level = True if raw_auto_level is None else (False if str(raw_auto_level).lower() in ("false", "0") else bool(raw_auto_level))
 
-                if not est or est in (180, 3600, 5400):
-                    cand = OUTPUT_DIR / fname
-                    if cand.exists():
-                        gcode_est = parse_estimated_time_from_gcode(cand)
-                        if gcode_est > 0:
-                            est = gcode_est
-                if not est:
-                    est = parse_time_from_string_or_filename(fname) or 3600
-
-                base_name = re.sub(r"\.(stl|3mf|gcode)$", "", fname, flags=re.IGNORECASE)
-                thumb_path = Path(f"/config/www/cc2_kiosk/thumbnails/{base_name}.png")
-                if not thumb_path.exists():
-                    tdata = fetch_thumbnail_from_printer(fname)
-                    if tdata:
-                        save_cached_thumbnail(base_name, tdata)
-
-                # Resolve slot & tray_id if not explicitly provided
-                if tray_id is None:
-                    tray_id, _cid = resolve_tray_and_canvas(slot=slot, filament=filament)
-                    if not slot:
-                        slot = f"A{tray_id + 1}"
-
-                job = {
-                    "id": f"job_{int(time.time() * 1000)}",
-                    "filename": fname,
-                    "display_name": data.get("display_name", fname),
-                    "filament": filament,
-                    "slot": slot,
-                    "tray_id": tray_id,
-                    "plate": plate,
-                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "slice_time_seconds": data.get("slice_time_seconds"),
-                    "estimated_seconds": est,
-                    "estimated_formatted": format_duration(est),
-                    "filesize": data.get("filesize", ""),
-                    "status": "queued",
-                }
-                queue.append(job)
-                save_queue(queue)
+                job = add_job_to_queue(
+                    filename=fname,
+                    est_seconds=est,
+                    filament=filament,
+                    plate=plate,
+                    slot=slot,
+                    tray_id=tray_id,
+                    slice_time_seconds=data.get("slice_time_seconds"),
+                    display_name=data.get("display_name", fname),
+                    auto_level=auto_level,
+                    filesize=data.get("filesize", ""),
+                )
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
