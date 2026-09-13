@@ -735,25 +735,139 @@ def save_history(history: list[dict[str, Any]]) -> None:
         print(f"[!] Error saving history: {e}", flush=True)
 
 
-def get_ams_slots() -> dict[str, str]:
+COLOR_NAMES_MAP = {
+    "Black": (0, 0, 0),
+    "White": (255, 255, 255),
+    "Grey": (128, 128, 128),
+    "Silver": (192, 192, 192),
+    "Red": (220, 20, 60),
+    "Coral / Pink": (249, 93, 119),
+    "Orange": (255, 140, 0),
+    "Yellow": (255, 242, 66),
+    "Green": (34, 139, 34),
+    "Lime": (50, 205, 50),
+    "Blue": (30, 144, 255),
+    "Navy": (0, 0, 128),
+    "Purple": (128, 0, 128),
+    "Cyan": (0, 206, 209),
+    "Brown": (139, 69, 19),
+}
+
+
+def approx_color_name(hex_code: str | None) -> str:
+    """Find the closest descriptive color name from a HEX string."""
+    if not hex_code or not str(hex_code).startswith("#") or len(str(hex_code)) < 7:
+        return ""
+    try:
+        h = str(hex_code).lstrip("#")
+        r, g, b = (int(h[i : i + 2], 16) for i in (0, 2, 4))
+        best_name = "Color"
+        min_dist = float("inf")
+        for name, (cr, cg, cb) in COLOR_NAMES_MAP.items():
+            dist = (r - cr) ** 2 + (g - cg) ** 2 + (b - cb) ** 2
+            if dist < min_dist:
+                min_dist = dist
+                best_name = name
+        return best_name
+    except Exception:
+        return "Color"
+
+
+_ams_cache: dict[str, Any] = {"ts": 0.0, "details": {}}
+
+
+def get_ams_details(force_refresh: bool = False) -> dict[str, dict[str, Any]]:
+    """
+    Fetch comprehensive AMS (Canvas) slot details including filament name, type, brand, and HEX color.
+    Uses Home Assistant Supervisor REST API with a 3-second cache.
+    """
+    global _ams_cache
+    now = time.time()
+    if not force_refresh and (now - _ams_cache.get("ts", 0)) < 3.0 and _ams_cache.get("details"):
+        return _ams_cache["details"]
+
     token = os.getenv("SUPERVISOR_TOKEN")
+    details: dict[str, dict[str, Any]] = {}
+
     if token:
         try:
-            slots = {}
-            for slot in ["a1", "a2", "a3", "a4"]:
-                req = urllib.request.Request(
-                    f"http://supervisor/core/api/states/sensor.cc2_{slot}_name",
-                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-                )
-                with urllib.request.urlopen(req, timeout=1.5) as resp:
-                    data = json.loads(resp.read().decode())
-                    val = data.get("state")
-                    slots[slot.upper()] = val if val not in ["unknown", "unavailable", None] else "Empty"
-            if any(v != "Empty" for v in slots.values()):
-                return slots
-        except Exception:
-            pass
-    return {"A1": "PLA", "A2": "PLA", "A3": "PLA PRO", "A4": "RAPID PLA+"}
+            req = urllib.request.Request(
+                "http://supervisor/core/api/states",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                all_states = {s["entity_id"]: s for s in json.loads(resp.read().decode())}
+
+            active_tray = all_states.get("sensor.cc2_active_tray_id", {}).get("state")
+            active_color = all_states.get("sensor.cc2_active_filament_color", {}).get("state")
+
+            for i, slot_name in enumerate(["a1", "a2", "a3", "a4"]):
+                slot_key = slot_name.upper()
+                name_state = all_states.get(f"sensor.cc2_{slot_name}_name", {}).get("state")
+                color_state = all_states.get(f"sensor.cc2_{slot_name}_color", {}).get("state")
+                attr_data = all_states.get(f"sensor.cc2_{slot_name}_attributes", {}).get("attributes", {})
+
+                is_empty = name_state in ["unknown", "unavailable", None, "Empty", "empty"]
+                name = "Empty" if is_empty else str(name_state).strip()
+                color = str(color_state).strip() if color_state and str(color_state).startswith("#") else "#808080"
+                c_name = approx_color_name(color) if not is_empty else ""
+
+                is_active = False
+                if not is_empty:
+                    if active_color and color and str(active_color).upper() == color.upper():
+                        is_active = True
+                    elif active_tray is not None and str(active_tray).isdigit() and int(active_tray) == i:
+                        is_active = True
+
+                details[slot_key] = {
+                    "slot": slot_key,
+                    "tray_id": i,
+                    "canvas_id": 0,
+                    "name": name,
+                    "type": attr_data.get("type") or (name.split()[0] if not is_empty else "None"),
+                    "color": color,
+                    "color_name": c_name,
+                    "brand": attr_data.get("brand", "ELEGOO") if not is_empty else "",
+                    "temp_range": attr_data.get("nozzle_temp_range", ""),
+                    "is_active": is_active,
+                    "is_loaded": not is_empty,
+                }
+
+            if any(v["is_loaded"] for v in details.values()):
+                _ams_cache = {"ts": now, "details": details}
+                return details
+        except Exception as e:
+            print(f"[!] Warning reading AMS details from supervisor: {e}", flush=True)
+
+    # Fallback defaults if supervisor is unreachable
+    defaults = {
+        "A1": {"name": "PLA", "color": "#FFF242", "color_name": "Yellow"},
+        "A2": {"name": "PLA", "color": "#F95D77", "color_name": "Coral / Pink"},
+        "A3": {"name": "PLA PRO", "color": "#898989", "color_name": "Grey"},
+        "A4": {"name": "RAPID PLA+", "color": "#000000", "color_name": "Black"},
+    }
+    fallback_details = {}
+    for i, (k, d) in enumerate(defaults.items()):
+        fallback_details[k] = {
+            "slot": k,
+            "tray_id": i,
+            "canvas_id": 0,
+            "name": d["name"],
+            "type": "PLA",
+            "color": d["color"],
+            "color_name": d["color_name"],
+            "brand": "ELEGOO",
+            "temp_range": "190-230°C",
+            "is_active": (i == 1),
+            "is_loaded": True,
+        }
+    return fallback_details
+
+
+def get_ams_slots() -> dict[str, str]:
+    """Returns slot name map e.g. {'A1': 'PLA', 'A2': 'PLA'} for backwards compatibility."""
+    details = get_ams_details()
+    return {k: v["name"] for k, v in details.items()}
 
 
 def match_filament(required_filament: str, ams_slots: dict[str, str]) -> dict[str, Any]:
@@ -1087,6 +1201,7 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
         if clean in ("/api/queue", "/queue"):
             queue = load_queue()
             ams = get_ams_slots()
+            ams_details = get_ams_details()
             total_eta = 0
             enhanced = []
             queue_dirty = False
@@ -1110,6 +1225,22 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                     est = parse_time_from_string_or_filename(item.get("filename", "")) or 3600
                 item_copy["estimated_seconds"] = est
                 item_copy["estimated_formatted"] = format_duration(est)
+
+                # Enrich slot color information
+                item_slot = (item.get("slot") or "").strip().upper()
+                slot_info = ams_details.get(item_slot)
+                if not slot_info:
+                    matched_slot = item_copy["filament_status"].get("slot")
+                    slot_info = ams_details.get(matched_slot) if matched_slot else None
+                if slot_info:
+                    item_copy["slot_color"] = slot_info.get("color", "#808080")
+                    item_copy["slot_color_name"] = slot_info.get("color_name", "")
+                    item_copy["slot_brand"] = slot_info.get("brand", "")
+                else:
+                    item_copy["slot_color"] = "#808080"
+                    item_copy["slot_color_name"] = ""
+                    item_copy["slot_brand"] = ""
+
                 if item.get("status") != "printing":
                     total_eta += est
                 enhanced.append(item_copy)
@@ -1124,9 +1255,27 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                 "queue": enhanced,
                 "items": enhanced,
                 "ams_slots": ams,
+                "ams_details": ams_details,
                 "count": len(enhanced),
                 "total_eta_seconds": total_eta,
                 "total_eta_formatted": format_duration(total_eta),
+            }).encode())
+            return
+
+        # 3b. AMS Slots & Colors API
+        if clean in ("/api/slots", "/slots", "/api/ams", "/ams"):
+            details = get_ams_details(force_refresh=True)
+            active_slot = next((k for k, v in details.items() if v.get("is_active")), "A2")
+            active_tray = details.get(active_slot, {}).get("tray_id", 1)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "success",
+                "active_slot": active_slot,
+                "active_tray_id": active_tray,
+                "slots": details,
+                "slots_list": list(details.values()),
             }).encode())
             return
 
