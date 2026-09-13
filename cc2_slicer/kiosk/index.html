@@ -331,6 +331,12 @@
         </div>
       </div>
 
+      <!-- Printer Busy Banner -->
+      <div id="modalBusyBanner" class="hidden p-2.5 rounded-xl bg-amber-950/50 border border-amber-500/50 text-amber-300 text-xs flex items-center space-x-2">
+        <i class="fa-solid fa-triangle-exclamation text-amber-400 shrink-0"></i>
+        <span id="modalBusyText">Printer is actively printing. Please wait for current print to finish.</span>
+      </div>
+
       <!-- Plate Selector -->
       <div>
         <label class="block text-[11px] text-gray-400 mb-1 font-semibold">Build Plate Type</label>
@@ -437,6 +443,8 @@
       "A4": { "slot": "A4", "tray_id": 3, "name": "RAPID PLA+", "color": "#000000", "color_name": "Black", "brand": "ELEGOO", "is_active": false, "is_loaded": true }
     };
     let currentModalJob = null;
+    let currentQueueItems = [];
+    let lastPrintStatus = null;
 
     // ───── Formatting Helpers ─────
     function formatDuration(sec) {
@@ -789,6 +797,8 @@
         const data = await res.json();
         const hud = document.getElementById('printHud');
 
+        lastPrintStatus = data;
+
         if (data.active) {
           hud.classList.remove('hidden');
           document.getElementById('hudFilename').innerText = data.filename || "Active Print";
@@ -799,6 +809,11 @@
           document.getElementById('hudRemaining').innerText = `ETA ${data.remaining_formatted || formatDuration(data.remaining_seconds)}`;
         } else {
           hud.classList.add('hidden');
+        }
+
+        // Live update modal busy state if modal is open
+        if (currentModalJob) {
+          updateModalBusyState();
         }
       } catch (e) {
         console.error("Print status error:", e);
@@ -812,6 +827,7 @@
         if (!res.ok) return;
         const data = await res.json();
         const items = data.queue || data.items || [];
+        currentQueueItems = items;
         const ams = data.ams_slots || {};
         const amsDetails = data.ams_details || {};
         cachedAmsSlots = ams;
@@ -893,7 +909,7 @@
                 </div>
               </div>
               <div class="flex items-center space-x-1.5 shrink-0">
-                <button onclick='openConfirmModalForJob(${JSON.stringify(item)})' class="w-8 h-8 rounded-xl bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white flex items-center justify-center text-xs transition" title="Start Print">
+                <button onclick="openConfirmModalForIndex(${idx})" class="w-8 h-8 rounded-xl bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600 hover:text-white flex items-center justify-center text-xs transition" title="Start Print">
                   <i class="fa-solid fa-play"></i>
                 </button>
                 <button onclick="deleteFromQueue('${item.id}')" class="w-8 h-8 rounded-xl bg-red-600/20 text-red-400 hover:bg-red-600 hover:text-white flex items-center justify-center text-xs transition" title="Remove">
@@ -985,8 +1001,40 @@
     }
 
     // ───── Print Confirmation Modal ─────
+    function updateModalBusyState() {
+      const busyBanner = document.getElementById('modalBusyBanner');
+      const busyText = document.getElementById('modalBusyText');
+      const confirmBtn = document.getElementById('modalConfirmBtn');
+      if (lastPrintStatus && lastPrintStatus.active) {
+        if (busyBanner) busyBanner.classList.remove('hidden');
+        if (busyText) {
+          const fn = lastPrintStatus.filename || "Active Job";
+          const pct = Math.round(lastPrintStatus.percent || 0);
+          busyText.innerText = `Printer is actively printing "${fn}" (${pct}%). Please wait for the current print to finish before starting a new job.`;
+        }
+        if (confirmBtn) {
+          confirmBtn.disabled = true;
+          confirmBtn.classList.add('opacity-50', 'cursor-not-allowed');
+          confirmBtn.title = 'Printer is actively printing';
+        }
+      } else {
+        if (busyBanner) busyBanner.classList.add('hidden');
+        if (confirmBtn) {
+          confirmBtn.disabled = false;
+          confirmBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+          confirmBtn.title = 'Start Print';
+        }
+      }
+    }
+
+    function openConfirmModalForIndex(idx) {
+      const job = currentQueueItems[idx];
+      if (job) openConfirmModalForJob(job);
+    }
+
     function openConfirmModalForJob(job) {
       currentModalJob = job;
+      updateModalBusyState();
       document.getElementById('modalFilename').innerText = job.display_name || job.filename;
       document.getElementById('modalEstTime').innerText = job.estimated_formatted || formatDuration(job.estimated_seconds);
 
@@ -1135,6 +1183,12 @@
     function closePrintModal() {
       document.getElementById('printModal').classList.add('hidden');
       currentModalJob = null;
+      const confirmBtn = document.getElementById('modalConfirmBtn');
+      if (confirmBtn) {
+        confirmBtn.disabled = false;
+        confirmBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+        confirmBtn.innerHTML = '<i class="fa-solid fa-play text-[10px]"></i><span>Start Print</span>';
+      }
     }
 
     function onModalPlateChange() {

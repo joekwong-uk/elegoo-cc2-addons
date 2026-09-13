@@ -20,7 +20,7 @@ import time
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, parse_qs
@@ -1394,6 +1394,47 @@ def get_cc2_files_direct() -> list[dict[str, Any]]:
         return files
 
 
+def get_current_print_status_info() -> dict[str, Any]:
+    token = os.getenv("SUPERVISOR_TOKEN")
+    p_status = "IDLE"
+    fname = ""
+    pct = 0.0
+    elapsed = 0
+    remain = 0
+
+    if token:
+        try:
+            for ent, target in [
+                ("sensor.cc2_print_status", "status"),
+                ("sensor.cc2_file_name", "fname"),
+                ("sensor.cc2_percent_complete", "pct"),
+                ("sensor.cc2_current_print_time", "elapsed"),
+                ("sensor.cc2_remaining_print_time", "remain")
+            ]:
+                req = urllib.request.Request(f"http://supervisor/core/api/states/{ent}", headers={"Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(req, timeout=1.0) as resp:
+                    data = json.loads(resp.read().decode())
+                    val = data.get("state")
+                    if val not in ["unknown", "unavailable", None, ""]:
+                        if target == "status": p_status = str(val).upper()
+                        elif target == "fname": fname = str(val)
+                        elif target == "pct": pct = float(val)
+                        elif target == "elapsed": elapsed = int(float(val))
+                        elif target == "remain": remain = int(float(val))
+        except Exception:
+            pass
+
+    is_active = p_status in ("RUNNING", "PRINTING", "PAUSE", "PAUSED", "WORKING", "RESUME", "BUSY")
+    return {
+        "is_active": is_active,
+        "status": p_status,
+        "filename": fname,
+        "percent": pct,
+        "elapsed": elapsed,
+        "remain": remain,
+    }
+
+
 def execute_cc2_start_print(
     filename: str,
     *,
@@ -2701,6 +2742,19 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                         target_job = j
                         break
 
+            st = get_current_print_status_info()
+            if st.get("is_active"):
+                self.send_response(409)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                cur_fn = st.get("filename") or "active print"
+                cur_pct = round(st.get("percent", 0))
+                self.wfile.write(json.dumps({
+                    "status": "error",
+                    "error": f"Printer is currently busy printing '{cur_fn}' ({cur_pct}%). Please wait for the current print to finish."
+                }).encode())
+                return
+
             if target_job:
                 if target_job.get("status") == "slicing":
                     self.send_response(400)
@@ -2852,13 +2906,26 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({"status": "success" if res.returncode == 0 else "error", "output": res.stdout}).encode())
             return
 
+        # 6. OctoPrint & Moonraker compatibility POSTs
+        if clean in ("/api/job", "/api/job/"):
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if clean.startswith("/api/files/local/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status": "success"}')
+            return
+
         self.send_response(404)
         self.end_headers()
 
 
 def run():
     server_address = ("", PORT)
-    httpd = HTTPServer(server_address, SlicerHTTPHandler)
+    httpd = ThreadingHTTPServer(server_address, SlicerHTTPHandler)
     print(f"[*] CC2 Slicer & Kiosk Microservice running on port {PORT}", flush=True)
     httpd.serve_forever()
 
