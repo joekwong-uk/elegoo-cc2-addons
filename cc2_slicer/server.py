@@ -123,7 +123,8 @@ def patch_pycentauri_cc2() -> None:
             import pycentauri.upload as up_mod
             p_up = Path(up_mod.__file__)
             t_up = p_up.read_text(encoding="utf-8")
-            new_t_up = re.sub(r'"X-File-Name":\s*name,', '"X-File-Name": name.encode("utf-8"),', t_up)
+            new_t_up = t_up.replace('X-File-Name: name.encode(utf-8),', '"X-File-Name": name.encode("utf-8"),')
+            new_t_up = re.sub(r'"X-File-Name":\s*name,', '"X-File-Name": name.encode("utf-8"),', new_t_up)
             if new_t_up != t_up:
                 p_up.write_text(new_t_up, encoding="utf-8")
                 print("[+] Patched pycentauri/upload.py for UTF-8 filename support", flush=True)
@@ -2182,6 +2183,12 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
             if ok:
                 history.insert(0, history_entry)
                 save_history(history)
+            elif target_job:
+                # Re-add job to queue so it is not lost on start failure
+                q_cur = load_queue()
+                if not any(j.get("id") == target_job.get("id") for j in q_cur):
+                    q_cur.insert(0, target_job)
+                    save_queue(q_cur)
 
             self.send_response(200 if ok else 500)
             self.send_header("Content-Type", "application/json")
