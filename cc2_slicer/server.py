@@ -1538,6 +1538,118 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
             }).encode())
             return
 
+        # 2b. OctoPrint & Moonraker Print Host Emulation (OrcaSlicer / ElegooSlicer direct spooler)
+        if clean in ("/api/version", "/api/version/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "api": "0.1",
+                "server": "1.9.3",
+                "text": "OctoPrint 1.9.3 (CC2 Queue Spooler)"
+            }).encode())
+            return
+
+        if clean in ("/api/printer", "/api/printer/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "temperature": {
+                    "tool0": {"actual": 25.0, "target": 0.0},
+                    "bed": {"actual": 25.0, "target": 0.0}
+                },
+                "state": {
+                    "text": "Operational",
+                    "flags": {
+                        "operational": True,
+                        "paused": False,
+                        "printing": False,
+                        "cancelling": False,
+                        "pausing": False,
+                        "sdReady": True,
+                        "error": False,
+                        "ready": True,
+                        "closedOrError": False
+                    }
+                }
+            }).encode())
+            return
+
+        if clean in ("/api/job", "/api/job/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "job": {
+                    "file": {
+                        "name": "CC2 Print Queue",
+                        "origin": "local",
+                        "size": 0
+                    },
+                    "estimatedPrintTime": 0
+                },
+                "progress": {
+                    "completion": 0.0,
+                    "printTime": 0,
+                    "printTimeLeft": 0
+                },
+                "state": "Operational"
+            }).encode())
+            return
+
+        if clean in ("/api/files", "/api/files/", "/api/files/local", "/api/files/local/"):
+            queue = load_queue()
+            files_list = []
+            for item in queue:
+                files_list.append({
+                    "name": item.get("filename", ""),
+                    "origin": "local",
+                    "size": 0,
+                    "date": int(time.time()),
+                })
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "files": files_list,
+                "free": "50GB",
+                "total": "100GB"
+            }).encode())
+            return
+
+        # Moonraker Fallback Endpoints
+        if clean in ("/server/info", "/server/info/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "result": {
+                    "klippy_connected": True,
+                    "klippy_state": "ready",
+                    "components": ["print_stats", "virtual_sdcard"]
+                }
+            }).encode())
+            return
+
+        if clean in ("/printer/info", "/printer/info/"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "result": {
+                    "state": "ready",
+                    "state_message": "Printer is ready"
+                }
+            }).encode())
+            return
+
         # 3. Queue API
         if clean in ("/api/queue", "/queue"):
             queue = load_queue()
@@ -1877,13 +1989,15 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         clean = self._normalize_path()
 
-        # 1. Slice and Upload
-        if clean in ("/api/upload", "/upload", "/api/slice", "/slice"):
+        # 1. Slice and Upload / OctoPrint & Moonraker Spooler
+        is_octoprint_upload = clean in ("/api/files/local", "/api/files/local/")
+        is_moonraker_upload = clean in ("/server/files/upload", "/server/files/upload/")
+        if clean in ("/api/upload", "/upload", "/api/slice", "/slice") or is_octoprint_upload or is_moonraker_upload:
             parsed_url = urlparse(self.path)
             qparams = parse_qs(parsed_url.query)
 
             raw_auto_queue = qparams.get("auto_queue", [""])[0] or self.headers.get("X-Auto-Queue", "")
-            auto_queue = raw_auto_queue.lower() in ("1", "true", "yes", "on")
+            auto_queue = (raw_auto_queue.lower() in ("1", "true", "yes", "on")) or is_octoprint_upload or is_moonraker_upload
 
             param_filament = qparams.get("filament", [""])[0] or self.headers.get("X-Filament", "")
             param_plate = qparams.get("plate", [""])[0] or self.headers.get("X-Plate", "")
@@ -2058,6 +2172,38 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                         res["queued"] = True
                         res["job"] = job
                         res["message"] = f"File {display_name} processed and added to print queue successfully!"
+
+                    if is_octoprint_upload:
+                        self.send_response(201)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            "files": {
+                                "local": {
+                                    "name": gcode_fname if auto_queue else filename,
+                                    "origin": "local",
+                                    "size": len(file_data)
+                                }
+                            },
+                            "done": True
+                        }).encode())
+                        return
+
+                    if is_moonraker_upload:
+                        self.send_response(201)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        self.wfile.write(json.dumps({
+                            "result": {
+                                "item": {
+                                    "filename": gcode_fname if auto_queue else filename,
+                                    "size": len(file_data)
+                                }
+                            }
+                        }).encode())
+                        return
 
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -2271,6 +2417,38 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
                     args=(saved_path, expected_jids, base_name, display_name),
                     daemon=True,
                 ).start()
+
+                if is_octoprint_upload:
+                    self.send_response(201)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "files": {
+                            "local": {
+                                "name": filename,
+                                "origin": "local",
+                                "size": len(file_data)
+                            }
+                        },
+                        "done": True
+                    }).encode())
+                    return
+
+                if is_moonraker_upload:
+                    self.send_response(201)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "result": {
+                            "item": {
+                                "filename": filename,
+                                "size": len(file_data)
+                            }
+                        }
+                    }).encode())
+                    return
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
