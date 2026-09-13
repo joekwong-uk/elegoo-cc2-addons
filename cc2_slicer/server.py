@@ -1323,6 +1323,16 @@ class SlicerHTTPHandler(BaseHTTPRequestHandler):
             is_active = p_status in ("RUNNING", "PRINTING", "PAUSE", "PAUSED", "WORKING", "RESUME", "BUSY")
             history = load_history()
             active_hist = next((h for h in history if h.get("status") == "printing"), None)
+            if not is_active and active_hist:
+                if p_status.upper() in ("IDLE", "COMPLETE", "COMPLETED", "STANDBY", "FINISH", "FINISHED", "STOPPED"):
+                    active_hist["status"] = "completed"
+                    active_hist["completed_at"] = time.time()
+                    if active_hist.get("started_at"):
+                        active_hist["duration_seconds"] = int(active_hist["completed_at"] - active_hist["started_at"])
+                        active_hist["duration_formatted"] = format_duration(active_hist["duration_seconds"])
+                    save_history(history)
+                    active_hist = None
+
             if not fname and active_hist:
                 fname = active_hist.get("filename", "")
             if not started_at and active_hist:
